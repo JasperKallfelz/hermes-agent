@@ -2010,8 +2010,10 @@ def run_conversation(
     # all run inside Codex). Default Hermes path is bypassed entirely.
     # See agent/transports/codex_app_server_session.py for the adapter
     # and references/codex-app-server-runtime.md for the rationale.
-    if agent.api_mode == "codex_app_server":
-        return agent._run_codex_app_server_turn(
+    from agent.external_runtime import EXTERNAL_API_MODES, dispatch_external_turn
+    if agent.api_mode in EXTERNAL_API_MODES:
+        return dispatch_external_turn(
+            agent,
             user_message=user_message,
             original_user_message=original_user_message,
             messages=messages,

@@ -3573,6 +3573,35 @@ class CLICommandsMixin:
         from cli import CLI_CONFIG, _ACCENT, _DIM, _RST, _cprint, _parse_reasoning_config, save_config_value
         parts = cmd.strip().split(maxsplit=1)
 
+        if self.agent and getattr(self.agent, "api_mode", None) == "pi_rpc":
+            from agent.pi_runtime import get_or_create_pi_session
+
+            try:
+                session = get_or_create_pi_session(self.agent)
+                if len(parts) < 2:
+                    state = session.get_state()
+                    _cprint(
+                        f"  {_ACCENT}runtime=pi · model={state.model_provider or 'unknown'}/"
+                        f"{state.model_id or 'unknown'} · thinking={state.thinking_level or 'off'} · "
+                        f"session={state.session_id or 'starting'}{_RST}"
+                    )
+                    return
+                level = parts[1].strip().lower().split()[0]
+                if level == "none":
+                    level = "off"
+                if level not in {"off", "minimal", "low", "medium", "high", "xhigh", "max"}:
+                    _cprint(f"  {_DIM}Pi thinking levels: off, minimal, low, medium, high, xhigh, max{_RST}")
+                    return
+                state = session.set_thinking_level(level)
+                _cprint(
+                    f"  {_ACCENT}✓ runtime=pi · model={state.model_provider or 'unknown'}/"
+                    f"{state.model_id or 'unknown'} · thinking={state.thinking_level or level}{_RST}"
+                )
+                return
+            except Exception as exc:
+                _cprint(f"  {_DIM}Pi thinking control failed: {exc}{_RST}")
+                return
+
         if len(parts) < 2:
             # Show current state
             rc = self.reasoning_config

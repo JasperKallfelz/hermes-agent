@@ -1255,6 +1255,8 @@ def _interrupt_session_turn(
         session["_turn_cancel_requested"] = True
         session["queued_prompt"] = None
         session.pop("queued_prompts", None)
+        session.pop("_queued_prompt_inflight", None)
+        session.pop("_compute_host_dispatch_inflight", None)
         session["_queued_prompt_generation"] = int(
             session.get("_queued_prompt_generation", 0)
         ) + 1
@@ -2698,6 +2700,9 @@ def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -
         session["running"] = False
         session["last_active"] = time.time()
         _clear_inflight_turn(session)
+        claim = session.get("_compute_host_dispatch_inflight")
+        if isinstance(claim, dict) and claim.get("dispatch_id") == frame.get("request_id"):
+            session.pop("_compute_host_dispatch_inflight", None)
     if is_error:
         message = str(frame.get("message") or "compute host turn failed")
         _emit("message.complete", sid, {"text": f"Error: {message}", "status": "error"})
@@ -2730,21 +2735,70 @@ def _submit_prompt_to_compute_host(
         queued_prompt_generation=queued_prompt_generation,
         display_kind=display_kind,
     )
+    dispatch_id = str(frame.get("request_id") or rid)
+    with session["history_lock"]:
+        session["_compute_host_dispatch_inflight"] = {
+            "dispatch_id": dispatch_id,
+            "prompt": text,
+            "status": "dispatching",
+        }
 
     def _complete(done: dict) -> None:
-        # submit_turn reports a synchronous pipe failure through the callback
-        # before re-raising. Leave the parent session untouched so prompt.submit
-        # can fail open to the historical in-process path without emitting a
-        # duplicate terminal error.
-        if done.get("reason") == "send_failed":
+        uncertain = False
+        with session["history_lock"]:
+            claim = session.get("_compute_host_dispatch_inflight")
+            if (
+                isinstance(claim, dict)
+                and claim.get("dispatch_id") == dispatch_id
+                and claim.get("status") == "dispatch_uncertain"
+            ):
+                # Even a later terminal frame does not mutate/replay parent
+                # state automatically. Explicit stop/reset is the recovery
+                # boundary for a dispatch whose pipe acceptance was unknown.
+                claim["terminal_frame"] = str(done.get("type") or "unknown")
+                session["running"] = False
+                uncertain = True
+        if uncertain:
             return
         _on_compute_host_turn_done(rid, sid, session, done)
 
     try:
         _get_compute_host_supervisor(cfg).submit_turn(frame, on_complete=_complete)
     except Exception as exc:
-        return _err(rid, 5019, f"compute-host dispatch failed: {exc}")
+        from tui_gateway.host_supervisor import ComputeHostDispatchError
+
+        accepted = (
+            exc.prompt_accepted
+            if isinstance(exc, ComputeHostDispatchError)
+            else None
+        )
+        phase = exc.phase if isinstance(exc, ComputeHostDispatchError) else "after_send_uncertain"
+        with session["history_lock"]:
+            claim = session.get("_compute_host_dispatch_inflight")
+            if isinstance(claim, dict) and claim.get("dispatch_id") == dispatch_id:
+                if accepted is False:
+                    session.pop("_compute_host_dispatch_inflight", None)
+                else:
+                    claim["status"] = "dispatch_uncertain"
+                    claim["phase"] = phase
+                    session["running"] = False
+                    session["_compute_host_active"] = True
+        response = _err(rid, 5019, f"compute-host dispatch failed: {exc}")
+        response["error"]["data"] = {
+            "dispatch_id": dispatch_id,
+            "phase": phase,
+            "prompt_accepted": accepted,
+            "reconciliation_required": accepted is not False,
+        }
+        return response
     with session["history_lock"]:
+        claim = session.get("_compute_host_dispatch_inflight")
+        if (
+            isinstance(claim, dict)
+            and claim.get("dispatch_id") == dispatch_id
+            and claim.get("status") == "dispatching"
+        ):
+            session.pop("_compute_host_dispatch_inflight", None)
         session["_compute_host_active"] = True
         if image_paths is None:
             session["attached_images"] = []
@@ -6235,6 +6289,21 @@ def _apply_model_switch(
         raise ValueError("model value required")
 
     agent = session.get("agent")
+    if agent is not None and getattr(agent, "api_mode", None) == "pi_rpc":
+        if is_global_flag or one_turn:
+            raise ValueError("Pi model selection is scoped to its native session")
+        from agent.pi_runtime import parse_pi_model_selection, select_pi_model
+
+        provider, model_input = parse_pi_model_selection(model_input, explicit_provider)
+        state = select_pi_model(agent, provider, model_input)
+        _emit("session.info", sid, _session_info(agent, session))
+        return {
+            "value": agent.model,
+            "warning": "",
+            "confirm_required": False,
+            "scope": "session",
+            "runtime": "pi_rpc",
+        }
     if one_turn and not agent:
         raise ValueError("/model --once requires a live session")
     if agent:
@@ -8487,6 +8556,8 @@ def _reset_session_agent(sid: str, session: dict) -> dict:
     session["attached_images"] = []
     session["queued_prompt"] = None
     session.pop("queued_prompts", None)
+    session.pop("_queued_prompt_inflight", None)
+    session.pop("_compute_host_dispatch_inflight", None)
     session["_queued_prompt_generation"] = int(session.get("_queued_prompt_generation", 0)) + 1
     session["edit_snapshots"] = {}
     session["image_counter"] = 0
@@ -8594,12 +8665,15 @@ def _resolve_runtime_with_fallback(
     overloading a nullable model as control flow.
     """
     from hermes_cli.auth import AuthError
-    from hermes_cli.runtime_provider import resolve_runtime_provider
+    from hermes_cli.runtime_provider import (
+        resolve_main_agent_runtime_provider,
+        resolve_runtime_provider,
+    )
 
     kwargs = resolve_kwargs or {}
     try:
         return _RuntimeFallbackResolution(
-            resolve_runtime_provider(**kwargs),
+            resolve_main_agent_runtime_provider(**kwargs),
             None,
             False,
         )
@@ -9981,11 +10055,18 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         if not queued or session.get("running"):
             return False
         queue_generation = int(session.get("_queued_prompt_generation", 0))
+        dispatch_id = f"queued-{uuid.uuid4().hex}"
         queued_prompts = session.get("queued_prompts") or []
         session["queued_prompt"] = queued_prompts.pop(0) if queued_prompts else None
         if not queued_prompts:
             session.pop("queued_prompts", None)
         session["running"] = True
+        session["_queued_prompt_inflight"] = {
+            "dispatch_id": dispatch_id,
+            "generation": queue_generation,
+            "prompt": queued,
+            "status": "claimed",
+        }
         if queued.get("transport") is not None:
             session["transport"] = queued["transport"]
     use_compute_host = _session_uses_compute_host(session)
@@ -10007,10 +10088,12 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
             else:
                 session.pop("queued_prompts", None)
             session["running"] = False
+            session.pop("_queued_prompt_inflight", None)
             return True
-    dispatch_failed = False
+    compute_dispatch = False
     try:
         if use_compute_host:
+            compute_dispatch = True
             if queued.get("image_paths"):
                 resp = _submit_prompt_to_compute_host(
                     rid,
@@ -10025,12 +10108,72 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     rid, sid, session, queued["text"], queued_prompt_generation=queue_generation
                 )
             if resp.get("error"):
-                message = str(((resp.get("error") or {}).get("message")) or "queued prompt failed")
+                error = resp.get("error") or {}
+                data = error.get("data") or {}
+                replay_safe = (
+                    isinstance(data, dict)
+                    and data.get("prompt_accepted") is False
+                    and data.get("phase") == "before_send"
+                    and data.get("reconciliation_required") is False
+                )
+                if replay_safe:
+                    with session["history_lock"]:
+                        if int(session.get("_queued_prompt_generation", 0)) != queue_generation:
+                            session["running"] = False
+                            session.pop("_queued_prompt_inflight", None)
+                            return True
+                        _clear_inflight_turn(session)
+                        session["running"] = True
+                        claim = session.get("_queued_prompt_inflight")
+                        if (
+                            isinstance(claim, dict)
+                            and claim.get("dispatch_id") == dispatch_id
+                        ):
+                            claim["status"] = "inline_fallback"
+                    # The host proved it never accepted this generation. From
+                    # here onward an inline dispatch failure is replay-safe too.
+                    compute_dispatch = False
+                    if queued.get("image_paths"):
+                        _run_prompt_submit(
+                            rid,
+                            sid,
+                            session,
+                            queued["text"],
+                            image_paths=queued["image_paths"],
+                            queued_prompt_generation=queue_generation,
+                        )
+                    else:
+                        _run_prompt_submit(
+                            rid,
+                            sid,
+                            session,
+                            queued["text"],
+                            queued_prompt_generation=queue_generation,
+                        )
+                    with session["history_lock"]:
+                        claim = session.get("_queued_prompt_inflight")
+                        if (
+                            isinstance(claim, dict)
+                            and claim.get("dispatch_id") == dispatch_id
+                        ):
+                            session.pop("_queued_prompt_inflight", None)
+                else:
+                    message = str(error.get("message") or "queued prompt failed")
+                    with session["history_lock"]:
+                        session["running"] = False
+                        _clear_inflight_turn(session)
+                        claim = session.get("_queued_prompt_inflight")
+                        if (
+                            isinstance(claim, dict)
+                            and claim.get("dispatch_id") == dispatch_id
+                        ):
+                            claim["status"] = "dispatch_uncertain"
+                    _emit("error", sid, {"message": message})
+            else:
                 with session["history_lock"]:
-                    session["running"] = False
-                    _clear_inflight_turn(session)
-                _emit("error", sid, {"message": message})
-                dispatch_failed = True
+                    claim = session.get("_queued_prompt_inflight")
+                    if isinstance(claim, dict) and claim.get("dispatch_id") == dispatch_id:
+                        session.pop("_queued_prompt_inflight", None)
         else:
             if queued.get("image_paths"):
                 _run_prompt_submit(
@@ -10049,6 +10192,10 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     queued["text"],
                     queued_prompt_generation=queue_generation,
                 )
+            with session["history_lock"]:
+                claim = session.get("_queued_prompt_inflight")
+                if isinstance(claim, dict) and claim.get("dispatch_id") == dispatch_id:
+                    session.pop("_queued_prompt_inflight", None)
     except Exception as exc:
         print(
             f"[tui_gateway] queued prompt dispatch failed: "
@@ -10057,14 +10204,23 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         )
         with session["history_lock"]:
             session["running"] = False
-        dispatch_failed = True
-    if dispatch_failed:
-        with session["history_lock"]:
-            drain_next = bool(session.get("queued_prompt")) and not session.get(
-                "_turn_cancel_requested"
-            )
-        if drain_next:
-            _drain_queued_prompt(rid, sid, session)
+            claim = session.get("_queued_prompt_inflight")
+            if isinstance(claim, dict) and claim.get("dispatch_id") == dispatch_id:
+                if compute_dispatch:
+                    # A remote pipe may have accepted bytes before reporting
+                    # failure. Keep the identity and never replay it.
+                    claim["status"] = "dispatch_uncertain"
+                else:
+                    session.pop("_queued_prompt_inflight", None)
+                    current = session.get("queued_prompt")
+                    later = list(session.get("queued_prompts") or [])
+                    session["queued_prompt"] = queued
+                    if current is not None:
+                        session["queued_prompts"] = [current, *later]
+                    elif later:
+                        session["queued_prompts"] = later
+                    else:
+                        session.pop("queued_prompts", None)
     return True
 
 
@@ -14152,6 +14308,26 @@ def _(rid, params: dict) -> dict:
             arg = str(value or "").strip().lower()
             scope = str(params.get("scope") or "").strip().lower()
             global_scope = scope == "global"
+            pi_agent = session.get("agent") if session else None
+            if pi_agent is not None and getattr(pi_agent, "api_mode", None) == "pi_rpc":
+                if global_scope:
+                    return _err(rid, 4002, "Pi thinking is scoped to its native session")
+                if arg == "none":
+                    arg = "off"
+                if arg in {"off", "minimal", "low", "medium", "high", "xhigh", "max"}:
+                    from agent.pi_runtime import get_or_create_pi_session
+
+                    pi_session = get_or_create_pi_session(pi_agent)
+                    state = pi_session.set_thinking_level(arg)
+                    _emit(
+                        "session.info",
+                        params.get("session_id", ""),
+                        _session_info(pi_agent, session),
+                    )
+                    return _ok(
+                        rid,
+                        {"key": key, "value": state.thinking_level or arg, "runtime": "pi_rpc"},
+                    )
             if arg in {"show", "on"}:
                 cfg = _load_cfg_raw()  # write-back round-trip
                 display = (
@@ -15907,6 +16083,24 @@ def _format_live_model_output(session: dict) -> str:
 def _live_slash_command_output(sid: str, session: Optional[dict], name: str, arg: str) -> Optional[str]:
     name = (name or "").lstrip("/").lower()
     arg = arg or ""
+    if name == "runtime" and arg.lower().split()[:1] == ["reconcile"]:
+        parts = arg.lower().split()
+        if len(parts) != 2 or parts[1] not in {"inspect", "adopt", "abandon"}:
+            return "Usage: /runtime reconcile inspect|adopt|abandon"
+        if session is None or session.get("agent") is None:
+            return "Pi reconciliation requires an active Pi runtime session"
+        if session.get("running"):
+            return "session busy — wait for the current turn to stop before reconciliation"
+        try:
+            from agent.pi_runtime import (
+                format_pi_reconciliation_report,
+                reconcile_pi_agent,
+            )
+
+            report = reconcile_pi_agent(session["agent"], parts[1])
+            return format_pi_reconciliation_report(report)
+        except Exception as exc:
+            return f"Pi reconciliation failed: {exc}"
     if name == "model" and not arg.strip():
         return _format_live_model_output(session or {})
     if name not in _LIVE_SESSION_DIRECT_COMMANDS:

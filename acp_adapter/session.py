@@ -258,6 +258,10 @@ class SessionManager:
         original = self.get_session(session_id)  # checks DB too
         if original is None:
             return None
+        if getattr(original.agent, "api_mode", None) == "pi_rpc":
+            raise RuntimeError(
+                "Pi RPC sessions cannot be forked because native context cloning is unsupported"
+            )
 
         new_id = str(uuid.uuid4())
         agent = self._make_agent(
@@ -614,7 +618,7 @@ class SessionManager:
 
         from run_agent import AIAgent
         from hermes_cli.config import load_config
-        from hermes_cli.runtime_provider import resolve_runtime_provider
+        from hermes_cli.runtime_provider import resolve_main_agent_runtime_provider
 
         config = load_config()
         model_cfg = config.get("model")
@@ -645,7 +649,9 @@ class SessionManager:
         }
 
         try:
-            runtime = resolve_runtime_provider(requested=requested_provider or config_provider)
+            runtime = resolve_main_agent_runtime_provider(
+                requested=requested_provider or config_provider
+            )
             kwargs.update(
                 {
                     "provider": runtime.get("provider"),
@@ -657,6 +663,12 @@ class SessionManager:
                 }
             )
         except Exception:
+            agent_cfg = config.get("agent") or {}
+            if (
+                isinstance(agent_cfg, dict)
+                and str(agent_cfg.get("runtime") or "").strip().lower() == "pi_rpc"
+            ):
+                raise
             logger.debug("ACP session falling back to default provider resolution", exc_info=True)
 
         _register_task_cwd(session_id, cwd)

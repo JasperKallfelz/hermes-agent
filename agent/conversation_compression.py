@@ -2799,6 +2799,12 @@ def compress_context(
     checkpoint_required = (
         getattr(agent, "compression_checkpoint_required", False) is True
     )
+    if getattr(agent, "api_mode", None) == "pi_rpc":
+        # Pi owns native compaction; Hermes must never compact its projection.
+        existing_prompt = getattr(agent, "_cached_system_prompt", None)
+        if not existing_prompt:
+            existing_prompt = agent._build_system_prompt(system_message)
+        return messages, existing_prompt
     if getattr(agent, "api_mode", None) == "codex_app_server":
         if checkpoint_required:
             raise _checkpoint_blocked(

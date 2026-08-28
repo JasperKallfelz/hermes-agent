@@ -365,6 +365,23 @@ def _(rid, params: dict) -> dict:
     while True:
         busy_transport = None
         with session["history_lock"]:
+            queued_claim = session.get("_queued_prompt_inflight")
+            compute_claim = session.get("_compute_host_dispatch_inflight")
+            if (
+                (
+                    isinstance(queued_claim, dict)
+                    and queued_claim.get("status") == "dispatch_uncertain"
+                )
+                or (
+                    isinstance(compute_claim, dict)
+                    and compute_claim.get("status") == "dispatch_uncertain"
+                )
+            ):
+                return _err(
+                    rid,
+                    4091,
+                    "queued prompt dispatch is uncertain; stop or reset the session before continuing",
+                )
             if session.get("running"):
                 # Don't reject a mid-turn prompt — queue it (and, by default,
                 # interrupt the live turn) so it runs as the next turn. The
@@ -829,8 +846,20 @@ def _(rid, params: dict) -> dict:
             if survivor_row_id_map is not None:
                 isolated_response["result"]["survivor_row_id_map"] = survivor_row_id_map
             return isolated_response
+        dispatch_data = (isolated_response.get("error") or {}).get("data") or {}
+        if dispatch_data.get("prompt_accepted") is not False:
+            return _ok(
+                rid,
+                {
+                    "status": "reconciliation_required",
+                    "dispatch_id": dispatch_data.get("dispatch_id"),
+                    "phase": dispatch_data.get("phase") or "after_send_uncertain",
+                    "prompt_accepted": None,
+                    "reconciliation_required": True,
+                },
+            )
         logger.warning(
-            "compute-host dispatch failed for session %s; falling back inline: %s",
+            "compute-host dispatch proved pre-send for session %s; falling back inline: %s",
             sid,
             isolated_response["error"].get("message", "unknown error"),
         )

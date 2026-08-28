@@ -739,6 +739,19 @@ class GatewaySlashCommandsMixin:
         ])
         if model_line:
             lines.append(model_line)
+        if status_agent is not None and getattr(status_agent, "api_mode", None) == "pi_rpc":
+            pi_session = getattr(status_agent, "_pi_rpc_session", None)
+            pi_state = pi_session._runtime_state() if pi_session else None
+            if pi_state:
+                lines.append(
+                    "Runtime: pi · "
+                    f"Model: {pi_state.model_provider or 'unknown'}/"
+                    f"{pi_state.model_id or 'unknown'} · "
+                    f"Thinking: {pi_state.thinking_level or 'off'} · "
+                    f"Native Session: {pi_state.session_id or 'starting'}"
+                )
+            else:
+                lines.append("Runtime: pi · Native Session: not started")
         if context_line:
             lines.append(context_line)
         lines.extend([
@@ -1840,6 +1853,64 @@ class GatewaySlashCommandsMixin:
         # (#30479).
         source = await asyncio.to_thread(self._normalize_source_for_session_key, source)
         session_key = self._session_key_for_source(source)
+        runtime_agent = getattr(self, "_running_agents", {}).get(session_key)
+        if not runtime_agent:
+            cache_lock = getattr(self, "_agent_cache_lock", None)
+            cache = getattr(self, "_agent_cache", None)
+            if cache_lock and cache is not None:
+                with cache_lock:
+                    cached = cache.get(session_key)
+                    runtime_agent = cached[0] if isinstance(cached, tuple) else cached
+        if runtime_agent and getattr(runtime_agent, "api_mode", None) == "pi_rpc":
+            from agent.pi_runtime import (
+                get_or_create_pi_session,
+                parse_pi_model_selection,
+                select_pi_model,
+            )
+
+            if is_global_flag or one_turn:
+                return "✗ Pi model selection is scoped to its native session"
+            try:
+                pi_session = get_or_create_pi_session(runtime_agent)
+                models = await asyncio.to_thread(pi_session.available_models)
+                if not model_input and not explicit_provider:
+                    state = await asyncio.to_thread(pi_session.get_state)
+                    rows = [
+                        f"{item.get('provider')}/{item.get('id') or item.get('modelId')}"
+                        for item in models
+                        if isinstance(item, dict)
+                        and item.get("provider")
+                        and (item.get("id") or item.get("modelId"))
+                    ]
+                    current = (
+                        f"{state.model_provider or 'unknown'}/"
+                        f"{state.model_id or 'unknown'}"
+                    )
+                    visible = sorted(rows)[:100]
+                    if len(rows) > len(visible):
+                        visible.append(f"… {len(rows) - len(visible)} more Pi models")
+                    return "\n".join([f"Pi model: {current}", *visible])
+                provider, model_input = parse_pi_model_selection(
+                    model_input, explicit_provider
+                )
+                matches = [
+                    item for item in models
+                    if isinstance(item, dict)
+                    and str(item.get("id") or item.get("modelId") or "") == model_input
+                    and str(item.get("provider") or "") == provider
+                ]
+                if len(matches) != 1:
+                    return "✗ Pi model selection requires one exact available model and provider"
+                provider = str(matches[0].get("provider") or provider)
+                state = await asyncio.to_thread(
+                    select_pi_model, runtime_agent, provider, model_input
+                )
+                return (
+                    f"✓ runtime=pi · model={runtime_agent.provider}/{runtime_agent.model} · "
+                    f"thinking={state.thinking_level or 'off'}"
+                )
+            except Exception as exc:
+                return f"✗ Pi model control failed: {exc}"
         override = self._session_model_overrides.get(session_key, {})
         restore_snapshot = (
             self._snapshot_session_model_override(session_key) if one_turn else None
@@ -2571,6 +2642,35 @@ class GatewaySlashCommandsMixin:
 
         prefix = "✓" if result.success else "✗"
         return f"{prefix} {result.message}"
+
+    async def _handle_runtime_command(self, event: MessageEvent) -> str:
+        from hermes_cli import runtime_switch
+        from hermes_cli.config import load_config, save_config
+        raw_args = event.get_command_args().strip()
+        reconcile_parts = raw_args.lower().split()
+        if reconcile_parts[:1] == ["reconcile"]:
+            if len(reconcile_parts) != 2 or reconcile_parts[1] not in {"inspect", "adopt", "abandon"}:
+                return "❌ Usage: /runtime reconcile inspect|adopt|abandon"
+            try:
+                from agent.pi_runtime import (
+                    format_pi_reconciliation_report,
+                    reconcile_pi_agent,
+                )
+
+                session_key = self._session_key_for_source(event.source)
+                cached = self._agent_cache.get(session_key)
+                agent = cached[0] if isinstance(cached, tuple) else cached
+                report = reconcile_pi_agent(agent, reconcile_parts[1])
+                return "✓ " + format_pi_reconciliation_report(report)
+            except Exception as exc:
+                return f"✗ Pi reconciliation failed: {exc}"
+        value, errors = runtime_switch.parse_args(raw_args)
+        if errors:
+            return "❌ " + "\n❌ ".join(errors)
+        result = runtime_switch.apply(load_config(), value,
+                                      persist_callback=save_config if value is not None else None)
+        suffix = "\nStart a new session with /new to apply it." if result.success and result.requires_new_session else ""
+        return ("✓ " if result.success else "✗ ") + result.message + suffix
 
     async def _handle_personality_command(self, event: MessageEvent) -> str:
         """Handle /personality command - list or set a personality.
@@ -3811,6 +3911,38 @@ class GatewaySlashCommandsMixin:
         # reads — same fix as /model (#30479).
         _reasoning_source = await asyncio.to_thread(self._normalize_source_for_session_key, event.source)
         session_key = self._session_key_for_source(_reasoning_source)
+        _runtime_agent = getattr(self, "_running_agents", {}).get(session_key)
+        if not _runtime_agent:
+            _cache_lock = getattr(self, "_agent_cache_lock", None)
+            _cache = getattr(self, "_agent_cache", None)
+            if _cache_lock and _cache is not None:
+                with _cache_lock:
+                    _cached = _cache.get(session_key)
+                    _runtime_agent = _cached[0] if isinstance(_cached, tuple) else _cached
+        if _runtime_agent and getattr(_runtime_agent, "api_mode", None) == "pi_rpc":
+            from agent.pi_runtime import get_or_create_pi_session
+
+            try:
+                _pi_session = get_or_create_pi_session(_runtime_agent)
+                if not raw_args:
+                    _state = await asyncio.to_thread(_pi_session.get_state)
+                    return (
+                        f"runtime=pi · model={_state.model_provider or 'unknown'}/"
+                        f"{_state.model_id or 'unknown'} · thinking={_state.thinking_level or 'off'} · "
+                        f"session={_state.session_id or 'starting'}"
+                    )
+                _level = args.split()[0].lower() if args else ""
+                if _level == "none":
+                    _level = "off"
+                if _level not in {"off", "minimal", "low", "medium", "high", "xhigh", "max"}:
+                    return "Pi thinking levels: off, minimal, low, medium, high, xhigh, max"
+                _state = await asyncio.to_thread(_pi_session.set_thinking_level, _level)
+                return (
+                    f"✓ runtime=pi · model={_state.model_provider or 'unknown'}/"
+                    f"{_state.model_id or 'unknown'} · thinking={_state.thinking_level or _level}"
+                )
+            except Exception as exc:
+                return f"✗ Pi thinking control failed: {exc}"
         self._show_reasoning = self._load_show_reasoning()
         # Use the session's effective model (session /model override wins over
         # config default) so per-model reasoning_overrides display correctly.

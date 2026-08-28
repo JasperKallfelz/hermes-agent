@@ -3124,6 +3124,41 @@ def run_doctor(args):
         for _issue in _issues_to_add:
             issues.append(_issue)
 
+    _section("Experimental Pi RPC Runtime")
+    try:
+        from hermes_cli.config import load_config as _load_pi_config
+
+        _pi_config = _load_pi_config()
+        _agent_config = (_pi_config.get("agent") or {}) if isinstance(_pi_config, dict) else {}
+        _pi_settings = (_agent_config.get("pi_rpc") or {}) if isinstance(_agent_config, dict) else {}
+        _pi_enabled = isinstance(_pi_settings, dict) and _pi_settings.get("enabled") is True
+        _pi_selected = isinstance(_agent_config, dict) and _agent_config.get("runtime") == "pi_rpc"
+        if not (_pi_enabled or _pi_selected):
+            check_info("Pi RPC is disabled (experimental, off by default)")
+        else:
+            from agent.transports.pi_runtime_doctor import check_pi_runtime
+
+            _pi_report = check_pi_runtime(
+                cwd=str(PROJECT_ROOT),
+                docker_image=str(_pi_settings.get("docker_image") or "") or None,
+                egress_allowlist={
+                    str(host) for host in (_pi_settings.get("egress_allowlist") or [])
+                    if isinstance(host, str)
+                },
+            )
+            if _pi_report.ok:
+                check_ok("Pi 0.84.3 package integrity and offline RPC handshake")
+                if _pi_report.docker_ok:
+                    check_ok("Immutable Pi Docker image and interactive containment")
+            else:
+                check_fail("Pi RPC runtime", f"({str(_pi_report.error or 'unknown failure')[:300]})")
+                manual_issues.append(
+                    "Repair the managed Pi 0.84.3 install, packaged image assets, contained RPC handshake, or immutable Docker image."
+                )
+    except Exception as e:
+        check_fail("Pi RPC doctor check failed", f"({e})")
+        manual_issues.append("Repair the experimental Pi RPC runtime doctor failure.")
+
     _section("Tool Availability")
     try:
         # Add project root to path for imports

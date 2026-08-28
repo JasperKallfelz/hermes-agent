@@ -105,7 +105,7 @@ def _session_source_for_agent(platform: Optional[str]) -> str:
 
 # OpenAI lazy proxy + safe stdio + proxy URL helpers — see agent/process_bootstrap.py.
 # `OpenAI` is re-exported here so `patch("run_agent.OpenAI", ...)` in tests works.
-# The other `# noqa: F401` re-exports below cover names accessed via
+# The other F401-suppressed re-exports below cover names accessed via
 # `mock.patch("run_agent.<X>")`, `from run_agent import <X>` in production
 # siblings, or the `_ra().<X>` indirection in agent/system_prompt.py — none
 # of which ruff's in-module usage scan can see.
@@ -3371,6 +3371,14 @@ class AIAgent:
                         "Failed to interrupt Codex app-server turn",
                         exc_info=True,
                     )
+        if getattr(self, "api_mode", None) == "pi_rpc":
+            _pi_session = getattr(self, "_pi_rpc_session", None)
+            _request_interrupt = getattr(_pi_session, "request_interrupt", None)
+            if callable(_request_interrupt):
+                try:
+                    _request_interrupt()
+                except Exception:
+                    logger.debug("Failed to interrupt Pi RPC turn", exc_info=True)
 
         # A cron turn performs its API request on the conversation thread to
         # avoid the nested interrupt-worker deadlock.  Unlike the normal worker
@@ -3534,6 +3542,15 @@ class AIAgent:
         if not text or not text.strip():
             return False
         cleaned = text.strip()
+        if getattr(self, "api_mode", None) == "pi_rpc":
+            _pi_session = getattr(self, "_pi_rpc_session", None)
+            _native_steer = getattr(_pi_session, "steer", None)
+            if callable(_native_steer):
+                try:
+                    return bool(_native_steer(cleaned))
+                except Exception:
+                    logger.debug("Pi RPC steer failed", exc_info=True)
+            return False
         _lock = getattr(self, "_pending_steer_lock", None)
         if _lock is None:
             # Test stubs that built AIAgent via object.__new__ skip __init__.
@@ -3548,6 +3565,25 @@ class AIAgent:
             else:
                 self._pending_steer = cleaned
         return True
+
+    def follow_up(self, text: str) -> bool:
+        """Queue a native runtime follow-up after the active Pi turn.
+
+        Hermes-native runtimes retain their existing frontend queue.  This
+        method is deliberately feature-detectable so gateways can use Pi's
+        ordering primitive without changing legacy queue semantics.
+        """
+        if not text or not text.strip() or getattr(self, "api_mode", None) != "pi_rpc":
+            return False
+        session = getattr(self, "_pi_rpc_session", None)
+        native_follow_up = getattr(session, "follow_up", None)
+        if not callable(native_follow_up):
+            return False
+        try:
+            return bool(native_follow_up(text.strip()))
+        except Exception:
+            logger.debug("Pi RPC follow_up failed", exc_info=True)
+            return False
 
     def redirect(self, text: str) -> bool:
         """Redirect the active turn without converting it into a new task.
@@ -3585,6 +3621,16 @@ class AIAgent:
                 except Exception:
                     logger.debug("Codex app-server turn/steer failed", exc_info=True)
                     return False
+
+        if getattr(self, "api_mode", None) == "pi_rpc":
+            _pi_session = getattr(self, "_pi_rpc_session", None)
+            _native_steer = getattr(_pi_session, "steer", None)
+            if callable(_native_steer):
+                try:
+                    return bool(_native_steer(cleaned))
+                except Exception:
+                    logger.debug("Pi RPC redirect/steer failed", exc_info=True)
+            return False
 
         # Never kill a tool merely to deliver conversational guidance. The
         # existing steer drain puts it on the final tool result before the next
@@ -4632,6 +4678,17 @@ class AIAgent:
             pass
 
         task_id = getattr(self, "session_id", None) or ""
+
+        # External runtimes own long-lived subprocess trees. Retire them at
+        # the same hard session boundary as all other agent resources.
+        for _runtime_attr in ("_pi_rpc_session", "_codex_session"):
+            try:
+                _runtime_session = getattr(self, _runtime_attr, None)
+                if _runtime_session is not None:
+                    _runtime_session.close()
+                    setattr(self, _runtime_attr, None)
+            except Exception:
+                pass
 
         # 1. Kill background processes for this task
         try:

@@ -307,7 +307,6 @@ const NO_DESKTOP_SURFACE: Record<DesktopUnavailableReason, readonly string[]> = 
     '/fast',
     '/insights',
     '/kanban',
-    '/reasoning',
     '/reload-mcp',
     '/reload_mcp',
     '/reload-skills',

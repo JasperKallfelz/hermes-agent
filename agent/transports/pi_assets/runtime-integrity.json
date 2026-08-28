@@ -1,0 +1,28 @@
+{
+  "package": "@earendil-works/pi-coding-agent",
+  "version": "0.84.3",
+  "source_date_epoch": 1704067200,
+  "tarball_sha512": "62bda9f4fb9badb15999810f608f82f0a9993fdc6516e2c39c01bae11b54d190e0add8976166becbb586c893b93a5a8f9623a454231df48cd5b333b7fedd03d3",
+  "package_json_sha256": "6c0bfa4558a0de32fb54fa97ca73397753ec7d4ad7d0ba607790920168de751f",
+  "cli_sha256": "1c3a5094b54aae9ae98c66516ce8c6578140363d081471ca7e91f9cb8c23dc8a",
+  "shrinkwrap_sha256": "df18751951cef578a1e5d809b33774bb385f69539f197bade0e70f1944aa3de7",
+  "manifest_sha256": "9fef223236a34bcab3a6926dcc1f3cd1f4d3504e3ce5eb37ac840b5ea0b280f2",
+  "egress_proxy_sha256": "0d8f3d724b70d141072fc51c42ccd6cc17296a5775d0bf68c2496b3de7882aab",
+  "bridge_sha256": "26058182f2aa31e5e3fd46160143e07cd3f6d506b8898970755128d2faac6bf5",
+  "npm_version": "11.17.0",
+  "registry_npm_tree_sha256": "1951e4981b80b2ffd23f8f6c26f91598b15e3892a94108f9b91a321c0f805716",
+  "image_npm_tree_sha256": "f845429e8c8fa262101900dd8eddaf43193ed9c0db51ab25085c6bedefc51370",
+  "npm_lock_helper_sha256": "12cc1596605c69034e94b40362c873864d8e5a0edec868251bc17a457dda52c2",
+  "verification_requirements_sha256": "18ceee9cfc1b05a75456c272adb20dfda896bd46064f105d0357898db9911857",
+  "asset_sha256": {
+    "Dockerfile": "7d324a3c00261186ca4fd8751b8d93c0f1e7c386eea988bb540a78788d313194",
+    "build-image.sh": "7eb1892fcc87a8f75e0f028d1612f527502bf36b1be7626f85fb3df1739d6895",
+    "egress_proxy.py": "0d8f3d724b70d141072fc51c42ccd6cc17296a5775d0bf68c2496b3de7882aab",
+    "hermes_bridge.ts": "26058182f2aa31e5e3fd46160143e07cd3f6d506b8898970755128d2faac6bf5",
+    "package-lock.json": "9fef223236a34bcab3a6926dcc1f3cd1f4d3504e3ce5eb37ac840b5ea0b280f2",
+    "package.json": "a8ae3676878cfdaada8a24b49aac8551867011c43d8ab8c130dde57e12990d73",
+    "verification-requirements.in": "dae374481a88d07e1e476b935fef18cd82b42ed9aadb0859ad01b3b2bb9c722a",
+    "verification-requirements.txt": "18ceee9cfc1b05a75456c272adb20dfda896bd46064f105d0357898db9911857",
+    "verify_npm_lock.py": "12cc1596605c69034e94b40362c873864d8e5a0edec868251bc17a457dda52c2"
+  }
+}

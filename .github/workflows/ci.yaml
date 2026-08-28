@@ -52,6 +52,7 @@ jobs:
       rust: ${{ steps.classify.outputs.rust }}
       docker_meta: ${{ steps.classify.outputs.docker_meta }}
       mcp_catalog: ${{ steps.classify.outputs.mcp_catalog }}
+      pi_runtime: ${{ steps.classify.outputs.pi_runtime }}
       ci_review: ${{ steps.classify.outputs.ci_review }}
       ci_review_files: ${{ steps.classify.outputs.ci_review_files }}
       event_name: ${{ github.event_name }}
@@ -178,6 +179,16 @@ jobs:
     if: needs.detect.outputs.docker_meta == 'true'
     uses: ./.github/workflows/docker-lint.yml
 
+  pi-runtime:
+    name: Pi runtime containment
+    needs: detect
+    if: needs.detect.outputs.pi_runtime == 'true'
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/pi-runtime.yml
+
   supply-chain:
     name: Supply-chain scan
     needs: detect
@@ -230,6 +241,7 @@ jobs:
       - uv-lockfile
       - lockfile-diff
       - docker-lint
+      - pi-runtime
       - supply-chain
       - review-labels
       - osv-scanner
@@ -243,6 +255,7 @@ jobs:
     outputs:
       needs-json: ${{ steps.evaluate.outputs.needs-json }}
     steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Evaluate job results
         id: evaluate
         env:
@@ -256,7 +269,8 @@ jobs:
           print(f'needs-json={json.dumps(compact)}')
           with open('$GITHUB_OUTPUT', 'a') as f:
               f.write(f'needs-json={json.dumps(compact)}\n')
-          failed = [name for name, info in needs.items() if info['result'] == 'failure']
+          from scripts.ci.classify_changes import unexpected_required_results
+          failed = unexpected_required_results(needs)
           for name, info in sorted(needs.items()):
               result = info['result']
               icon = '✅' if result in ('success', 'skipped') else '❌'

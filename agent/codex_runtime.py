@@ -773,7 +773,10 @@ def run_codex_app_server_turn(
     # return reaches us. Do NOT append again — that would duplicate.
 
     try:
-        turn = agent._codex_session.run_turn(user_input=user_message)
+        from agent.external_runtime.codex_adapter import CodexExternalRuntimeAdapter
+
+        adapter = CodexExternalRuntimeAdapter(agent._codex_session)
+        turn = adapter.run_turn(user_message)
     except Exception as exc:
         logger.exception("codex app-server turn failed")
         # Crash → unconditionally drop the session so the next turn
@@ -811,18 +814,6 @@ def run_codex_app_server_turn(
             "error": str(exc),
         }
 
-    # This runtime bypasses the normal conversation-loop finalizer. Mirror its
-    # interrupt handoff/cleanup so a hard stop cannot poison the next turn and a
-    # message-bearing compatibility interrupt can still be replayed by callers.
-    _user_interrupted = bool(
-        turn.interrupted and getattr(agent, "_interrupt_requested", False)
-    )
-    _interrupt_message = (
-        getattr(agent, "_interrupt_message", None) if _user_interrupted else None
-    )
-    if _user_interrupted:
-        agent.clear_interrupt()
-
     # If the turn signalled the underlying client is wedged (deadline
     # blown, post-tool watchdog tripped, OAuth refresh died, subprocess
     # exited), retire the session so the next turn respawns codex
@@ -839,136 +830,28 @@ def run_codex_app_server_turn(
             pass
         agent._codex_session = None
 
-    # Splice projected messages into the conversation. The projector emits
-    # standard {role, content, tool_calls, tool_call_id} entries, which
-    # is exactly what curator.py / sessions DB expect.
-    if turn.projected_messages:
-        from agent.message_metadata import append_message
-
-        for projected_message in turn.projected_messages:
-            append_message(messages, projected_message)
-
-        # Persist the newly-projected assistant/tool messages ourselves.
-        # This path is an early return that bypasses conversation_loop, whose
-        # normal per-step _persist_session() calls would otherwise flush them.
-        # The inbound user turn was already flushed at turn start
-        # (turn_context.py _persist_session), and _flush_messages_to_session_db
-        # is idempotent via the intrinsic _DB_PERSISTED_MARKER — so this writes
-        # ONLY the new codex projected rows and does NOT re-write the user turn.
-        # Keeping the agent as the sole persister lets us return
-        # agent_persisted=True below, so the gateway skips its own DB write and
-        # we avoid the #860/#42039 duplicate user-message write (append_message
-        # is a raw INSERT with no dedup, so a gateway re-write would duplicate
-        # the already-flushed user turn). See gateway/run.py agent_persisted.
-        if getattr(agent, "_session_db", None) is not None:
-            try:
-                _codex_flush_ok = agent._flush_messages_to_session_db(messages)
-            except Exception:
-                _codex_flush_ok = False
-                logger.warning(
-                    "codex app-server projected-message flush failed",
-                    exc_info=True,
-                )
-            if _codex_flush_ok is False:
-                # Unlike the chat-completions loop (which fails closed BEFORE
-                # projection — see conversation_loop session_persistence_failed),
-                # codex output has already streamed to the user by the time this
-                # flush runs, so there is nothing left to withhold. We cannot
-                # flip agent_persisted=False either: the gateway fallback write
-                # would re-INSERT the already-flushed user turn (#860/#42039).
-                # Surface the durability gap loudly instead of a silent debug.
-                logger.warning(
-                    "codex app-server turn was delivered but could NOT be "
-                    "persisted to the session DB (session=%s) — this turn "
-                    "will be missing after restart/resume",
-                    getattr(agent, "session_id", None),
-                )
-
-
-    # Counter ticks for the agent-improvement loop.
-    # _turns_since_memory and _user_turn_count are ALREADY incremented
-    # in the run_conversation() pre-loop block (lines ~11793-11817) so we
-    # do NOT touch them here — that would double-count.
-    # Only _iters_since_skill needs explicit increment, since the
-    # chat_completions loop bumps it per tool iteration (line ~12110)
-    # and that loop is bypassed on this path.
-    agent._iters_since_skill = (
-        getattr(agent, "_iters_since_skill", 0) + turn.tool_iterations
-    )
     _record_codex_app_server_compaction(agent, turn)
     usage_result = _record_codex_app_server_usage(agent, turn)
-    api_calls = 1
+    from agent.external_runtime.finalize import finalize_external_turn
 
-    # Now check the skill nudge AFTER iters were incremented — same
-    # pattern the chat_completions path uses (line ~15432).
-    should_review_skills = False
-    if (
-        agent._skill_nudge_interval > 0
-        and agent._iters_since_skill >= agent._skill_nudge_interval
-        and "skill_manage" in agent.valid_tool_names
-    ):
-        should_review_skills = True
-        agent._iters_since_skill = 0
-
-    # External memory provider sync (mirrors line ~15439). Skipped on
-    # interrupt/error to avoid feeding partial transcripts to memory.
-    if not turn.interrupted and turn.error is None:
-        try:
-            agent._sync_external_memory_for_turn(
-                original_user_message=original_user_message,
-                final_response=turn.final_text,
-                interrupted=False,
-                messages=messages,
-            )
-        except Exception:
-            logger.debug("external memory sync raised", exc_info=True)
-
-    # Background review fork — same cadence + signature as the default
-    # path (line ~15449). Only fires when a trigger actually tripped AND
-    # we have a real final response.
-    if (
-        turn.final_text
-        and not turn.interrupted
-        and (should_review_memory or should_review_skills)
-    ):
-        try:
-            agent._spawn_background_review(
-                messages_snapshot=list(messages),
-                review_memory=should_review_memory,
-                review_skills=should_review_skills,
-            )
-        except Exception:
-            logger.debug("background review spawn raised", exc_info=True)
-
-    return {
-        "final_response": turn.final_text,
-        "messages": messages,
-        "api_calls": api_calls,
-        "completed": not turn.interrupted and turn.error is None,
-        "partial": turn.interrupted or turn.error is not None,
-        "interrupted": _user_interrupted,
-        **(
-            {"interrupt_message": _interrupt_message}
-            if _interrupt_message
-            else {}
-        ),
-        "error": turn.error,
-        # The codex app-server runtime IS an early-return path that bypasses
-        # conversation_loop, but we flush the projected assistant/tool messages
-        # ourselves above (see the _flush_messages_to_session_db call after
-        # messages.extend). The inbound user turn was already flushed at turn
-        # start (turn_context._persist_session) and the flush dedups via
-        # _DB_PERSISTED_MARKER, so state.db ends up with each real message
-        # exactly once and session_search / conversation-distill see the full
-        # gateway conversation. Report agent_persisted=True so the gateway
-        # skips its own append_to_transcript DB write — writing again there
-        # would re-INSERT the already-flushed user turn (append_message has no
-        # dedup), reintroducing the #860 / #42039 duplicate-write bug.
-        "agent_persisted": True,
-        "codex_thread_id": turn.thread_id,
-        "codex_turn_id": turn.turn_id,
-        **usage_result,
-    }
+    result = finalize_external_turn(
+        agent,
+        messages,
+        turn,
+        runtime="codex_app_server",
+        original_user_message=original_user_message,
+        should_review_memory=should_review_memory,
+    )
+    # Codex's native usage payload has richer accounting than the neutral
+    # transport fields. Preserve its accepted public result keys verbatim.
+    result.update(
+        {
+            "codex_thread_id": turn.thread_id,
+            "codex_turn_id": turn.turn_id,
+            **usage_result,
+        }
+    )
+    return result
 
 
 # ---------------------------------------------------------------------------

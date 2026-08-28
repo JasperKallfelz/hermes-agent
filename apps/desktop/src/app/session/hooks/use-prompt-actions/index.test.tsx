@@ -126,7 +126,8 @@ function Harness({
   selectedStoredSessionIdRef: selectedStoredSessionIdRefProp,
   storedSessionId,
   activeSessionId,
-  createBackendSessionForSend
+  createBackendSessionForSend,
+  startFreshSessionDraft
 }: {
   activeSessionIdRef?: MutableRefObject<string | null>
   busyRef?: MutableRefObject<boolean>
@@ -152,6 +153,7 @@ function Harness({
   storedSessionId?: null | string
   activeSessionId?: null | string
   createBackendSessionForSend?: (preview?: null | string) => Promise<null | string>
+  startFreshSessionDraft?: () => void
 }) {
   const localActiveSessionIdRef = useRef<string | null>(
     activeSessionId === undefined ? RUNTIME_SESSION_ID : activeSessionId
@@ -201,7 +203,7 @@ function Harness({
     resumeStoredSession: resumeStoredSession ?? (() => undefined),
     runtimeIdByStoredSessionIdRef,
     selectedStoredSessionIdRef,
-    startFreshSessionDraft: () => undefined,
+    startFreshSessionDraft: startFreshSessionDraft ?? (() => undefined),
     sttEnabled: false,
     updateSessionState: (sessionId, updater, storedSessionId) => {
       // Seed with interrupted:true so we can prove a fresh submit clears it.
@@ -1164,6 +1166,45 @@ describe('usePromptActions slash.exec dispatch payloads', () => {
     expect(persistedModes.has('default')).toBe(false)
   })
 
+  it('dispatches Pi runtime, model, and thinking controls then honors the fresh-session boundary', async () => {
+    const calls: { method: string; params?: Record<string, unknown> }[] = []
+    const fresh = vi.fn()
+
+    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      calls.push({ method, params })
+
+      return { output: method === 'slash.exec' ? 'ok; start a new session to apply' : '' } as never
+    })
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        startFreshSessionDraft={fresh}
+      />
+    )
+
+    await handle!.submitText('/runtime pi')
+    await handle!.submitText('/model claude-test --provider anthropic')
+    await handle!.submitText('/reasoning high')
+
+    expect(calls).toEqual([
+      { method: 'slash.exec', params: { command: 'runtime pi', session_id: RUNTIME_SESSION_ID } },
+      {
+        method: 'slash.exec',
+        params: { command: 'model claude-test --provider anthropic', session_id: RUNTIME_SESSION_ID }
+      },
+      { method: 'slash.exec', params: { command: 'reasoning high', session_id: RUNTIME_SESSION_ID } }
+    ])
+    expect(fresh).not.toHaveBeenCalled()
+
+    await handle!.submitText('/new')
+    expect(fresh).toHaveBeenCalledOnce()
+    expect(calls).toHaveLength(3)
+  })
+
   it('submits /goal send directives returned directly by slash.exec instead of rendering no output', async () => {
     const calls: { method: string; params?: Record<string, unknown> }[] = []
     const states: Record<string, unknown>[] = []
@@ -1755,9 +1796,13 @@ describe('usePromptActions desktop slash pickers', () => {
       <Harness onReady={h => (handle = h)} refreshSessions={async () => undefined} requestGateway={requestGateway} />
     )
 
-    const result = handle!.submitText('/handoff telegram')
-    await vi.advanceTimersByTimeAsync(61_000)
-    await result
+    let result = false
+    await act(async () => {
+      const pending = handle!.submitTextRaw('/handoff telegram')
+      await vi.advanceTimersByTimeAsync(61_000)
+      result = await pending
+    })
+    expect(result).toBe(true)
 
     expect(calls.some(call => call.method === 'handoff.request')).toBe(true)
     expect(calls).toContainEqual({
@@ -3238,14 +3283,20 @@ describe('usePromptActions eager-upload races', () => {
     await waitFor(() => expect(handle).not.toBeNull())
 
     // Drop a file → the eager effect fires file.attach and blocks on it.
-    $composerAttachments.set([{ id: 'file:doc.pdf', kind: 'file', label: 'doc.pdf', path: '/Users/me/doc.pdf' }])
+    await act(async () => {
+      $composerAttachments.set([{ id: 'file:doc.pdf', kind: 'file', label: 'doc.pdf', path: '/Users/me/doc.pdf' }])
+    })
     await waitFor(() => expect(methods.filter(m => m === 'file.attach').length).toBe(1))
 
     // Submit reads the store, sees the upload in flight, and joins it.
-    const submitting = handle!.submitText('here you go')
-    releaseAttach()
+    let submitted = false
+    await act(async () => {
+      const submitting = handle!.submitTextRaw('here you go')
+      releaseAttach()
+      submitted = await submitting
+    })
 
-    expect(await submitting).toBe(true)
+    expect(submitted).toBe(true)
     // Exactly one file.attach (submit reused the eager result), then the send.
     expect(methods.filter(m => m === 'file.attach').length).toBe(1)
     expect(methods).toContain('prompt.submit')
@@ -4120,11 +4171,18 @@ describe('usePromptActions submit session-context isolation (#54527)', () => {
     )
     await waitFor(() => expect(handle).not.toBeNull())
 
-    const submitting = handle!.submitText('carefully composed prompt for project A')
+    let submitting!: Promise<boolean>
+    act(() => {
+      submitting = handle!.submitTextRaw('carefully composed prompt for project A')
+    })
     await waitFor(() => expect(calls.some(c => c.method === 'session.resume')).toBe(true))
-    releaseResume()
+    let submitted = true
+    await act(async () => {
+      releaseResume()
+      submitted = await submitting
+    })
 
-    expect(await submitting).toBe(false)
+    expect(submitted).toBe(false)
     expect(calls.some(c => c.method === 'prompt.submit')).toBe(false)
     expect(calls.find(c => c.method === 'session.resume')?.params).toEqual({
       session_id: STORED_SESSION_A,
@@ -4233,6 +4291,12 @@ describe('usePromptActions submit session-context isolation (#54527)', () => {
 
     let releaseResume: () => void = () => {}
 
+    let markResumeStarted: () => void = () => {}
+
+    const resumeStarted = new Promise<void>(resolve => {
+      markResumeStarted = resolve
+    })
+
     const selectedStoredSessionIdRef: MutableRefObject<string | null> = { current: STORED_SESSION_A }
 
     const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
@@ -4249,6 +4313,7 @@ describe('usePromptActions submit session-context isolation (#54527)', () => {
       if (method === 'session.resume') {
         await new Promise<void>(resolve => {
           releaseResume = resolve
+          markResumeStarted()
         })
         selectedStoredSessionIdRef.current = STORED_SESSION_B
 
@@ -4259,7 +4324,7 @@ describe('usePromptActions submit session-context isolation (#54527)', () => {
     })
 
     let handle: HarnessHandle | null = null
-    render(
+    await actRender(
       <Harness
         onReady={h => (handle = h)}
         refreshSessions={async () => undefined}
@@ -4268,13 +4333,16 @@ describe('usePromptActions submit session-context isolation (#54527)', () => {
         storedSessionId={STORED_SESSION_A}
       />
     )
-    await waitFor(() => expect(handle).not.toBeNull())
 
-    const submitting = handle!.submitText('message that must not land in session B')
-    await waitFor(() => expect(calls.some(c => c.method === 'session.resume')).toBe(true))
-    releaseResume()
+    let submitted = true
+    await act(async () => {
+      const submitting = handle!.submitTextRaw('message that must not land in session B')
+      await resumeStarted
+      releaseResume()
+      submitted = await submitting
+    })
 
-    expect(await submitting).toBe(false)
+    expect(submitted).toBe(false)
     expect(submitAttempts).toBe(1)
     expect(calls.filter(c => c.method === 'prompt.submit')).toHaveLength(1)
     expect(calls.find(c => c.method === 'session.resume')?.params).toMatchObject({
@@ -4517,6 +4585,12 @@ describe('usePromptActions new-chat first-send delivery (#63078)', () => {
 
     let releaseAttach: () => void = () => {}
 
+    let markAttachStarted: () => void = () => {}
+
+    const attachStarted = new Promise<void>(resolve => {
+      markAttachStarted = resolve
+    })
+
     $connection.set({ mode: 'remote' } as never)
     Object.defineProperty(window, 'hermesDesktop', {
       configurable: true,
@@ -4539,6 +4613,7 @@ describe('usePromptActions new-chat first-send delivery (#63078)', () => {
       if (method === 'file.attach') {
         await new Promise<void>(resolve => {
           releaseAttach = resolve
+          markAttachStarted()
         })
 
         return {
@@ -4561,7 +4636,7 @@ describe('usePromptActions new-chat first-send delivery (#63078)', () => {
     }
 
     let handle: HarnessHandle | null = null
-    render(
+    await actRender(
       <Harness
         activeSessionId={null}
         activeSessionIdRef={activeSessionIdRef}
@@ -4574,19 +4649,22 @@ describe('usePromptActions new-chat first-send delivery (#63078)', () => {
         storedSessionId={null}
       />
     )
-    await waitFor(() => expect(handle).not.toBeNull())
 
-    const submitting = handle!.submitText('first message', { attachments: [attachment] })
-    await waitFor(() => expect(calls.some(call => call.method === 'file.attach')).toBe(true))
+    let submitted = true
+    await act(async () => {
+      const submitting = handle!.submitTextRaw('first message', { attachments: [attachment] })
+      await attachStarted
 
-    // selectSidebarItem calls navigate() first. The routed effect has not yet
-    // entered resumeSession(), so the selected-session ref still points at the
-    // just-created session when attachment sync settles — the route move to a
-    // DIFFERENT chat must abort on its own.
-    routeToken = '/sidebar-target::'
-    releaseAttach()
+      // selectSidebarItem calls navigate() first. The routed effect has not yet
+      // entered resumeSession(), so the selected-session ref still points at the
+      // just-created session when attachment sync settles — the route move to a
+      // DIFFERENT chat must abort on its own.
+      routeToken = '/sidebar-target::'
+      releaseAttach()
+      submitted = await submitting
+    })
 
-    expect(await submitting).toBe(false)
+    expect(submitted).toBe(false)
     expect(selectedStoredSessionIdRef.current).toBe(NEW_STORED_ID)
     expect(calls.some(call => call.method === 'prompt.submit')).toBe(false)
   })
@@ -4603,6 +4681,12 @@ describe('usePromptActions new-chat first-send delivery (#63078)', () => {
     let routeToken = '/::'
 
     let releaseFileAttach: () => void = () => {}
+
+    let markFileAttachStarted: () => void = () => {}
+
+    const fileAttachStarted = new Promise<void>(resolve => {
+      markFileAttachStarted = resolve
+    })
 
     $connection.set({ mode: 'remote' } as never)
     Object.defineProperty(window, 'hermesDesktop', {
@@ -4627,6 +4711,7 @@ describe('usePromptActions new-chat first-send delivery (#63078)', () => {
         // Block here so the user can switch sessions mid-sync.
         await new Promise<void>(resolve => {
           releaseFileAttach = resolve
+          markFileAttachStarted()
         })
 
         return {
@@ -4648,7 +4733,7 @@ describe('usePromptActions new-chat first-send delivery (#63078)', () => {
     }
 
     let handle: HarnessHandle | null = null
-    render(
+    await actRender(
       <Harness
         activeSessionId={null}
         activeSessionIdRef={activeSessionIdRef}
@@ -4661,18 +4746,21 @@ describe('usePromptActions new-chat first-send delivery (#63078)', () => {
         storedSessionId={null}
       />
     )
-    await waitFor(() => expect(handle).not.toBeNull())
 
-    const submitting = handle!.submitText('message before the switch', { attachments: [attachment] })
-    await waitFor(() => expect(calls.some(c => c.method === 'file.attach')).toBe(true))
+    let submitted = true
+    await act(async () => {
+      const submitting = handle!.submitTextRaw('message before the switch', { attachments: [attachment] })
+      await fileAttachStarted
 
-    // Simulate a user switching to a different session after the new session
-    // was created and the sync phase started.
-    selectedStoredSessionIdRef.current = 'stored-other-session'
-    routeToken = '/stored-other-session::'
-    releaseFileAttach()
+      // Simulate a user switching to a different session after the new session
+      // was created and the sync phase started.
+      selectedStoredSessionIdRef.current = 'stored-other-session'
+      routeToken = '/stored-other-session::'
+      releaseFileAttach()
+      submitted = await submitting
+    })
 
-    expect(await submitting).toBe(false)
+    expect(submitted).toBe(false)
     expect(calls.some(c => c.method === 'prompt.submit')).toBe(false)
   })
 })
@@ -4694,6 +4782,13 @@ describe('usePromptActions busy-gateway churn tolerance (#64327)', () => {
     // chats — a send from a second chat must ride through it and reach
     // prompt.submit instead of silently aborting.
     let releaseResume: () => void = () => {}
+
+    let markResumeStarted: () => void = () => {}
+
+    const resumeStarted = new Promise<void>(resolve => {
+      markResumeStarted = resolve
+    })
+
     const calls: { method: string; params?: Record<string, unknown> }[] = []
 
     const selectedStoredSessionIdRef: MutableRefObject<string | null> = { current: STORED_ID }
@@ -4706,6 +4801,7 @@ describe('usePromptActions busy-gateway churn tolerance (#64327)', () => {
       if (method === 'session.resume') {
         await new Promise<void>(resolve => {
           releaseResume = resolve
+          markResumeStarted()
         })
 
         return { session_id: RESUMED_RUNTIME_ID } as never
@@ -4715,7 +4811,7 @@ describe('usePromptActions busy-gateway churn tolerance (#64327)', () => {
     })
 
     let handle: HarnessHandle | null = null
-    render(
+    await actRender(
       <Harness
         activeSessionId={null}
         activeSessionIdRef={activeSessionIdRef}
@@ -4727,21 +4823,24 @@ describe('usePromptActions busy-gateway churn tolerance (#64327)', () => {
         storedSessionId={STORED_ID}
       />
     )
-    await waitFor(() => expect(handle).not.toBeNull())
 
-    const submitting = handle!.submitText('send from a second chat on a busy gateway')
-    await waitFor(() => expect(calls.some(c => c.method === 'session.resume')).toBe(true))
+    let submitted = false
+    await act(async () => {
+      const submitting = handle!.submitTextRaw('send from a second chat on a busy gateway')
+      await resumeStarted
 
-    // Programmatic churn while resume is in flight — NOT user switches:
-    // a gateway/profile reconnect null-resets the selection...
-    selectedStoredSessionIdRef.current = null
-    // ...a background event retargets the active runtime ref (#47709 class)...
-    activeSessionIdRef.current = 'rt-some-background-session'
-    // ...and an overlay parks state in search/hash (pathname unchanged).
-    routeToken = `/${STORED_ID}:?panel=preview:#reply`
-    releaseResume()
+      // Programmatic churn while resume is in flight — NOT user switches:
+      // a gateway/profile reconnect null-resets the selection...
+      selectedStoredSessionIdRef.current = null
+      // ...a background event retargets the active runtime ref (#47709 class)...
+      activeSessionIdRef.current = 'rt-some-background-session'
+      // ...and an overlay parks state in search/hash (pathname unchanged).
+      routeToken = `/${STORED_ID}:?panel=preview:#reply`
+      releaseResume()
+      submitted = await submitting
+    })
 
-    expect(await submitting).toBe(true)
+    expect(submitted).toBe(true)
     expect(calls.find(c => c.method === 'prompt.submit')?.params).toMatchObject({
       session_id: RESUMED_RUNTIME_ID,
       text: 'send from a second chat on a busy gateway'
@@ -4893,6 +4992,13 @@ describe('usePromptActions busy-gateway churn tolerance (#64327)', () => {
     // The churn tolerance must not weaken the real guard: selection AND route
     // moving to another actual chat is a user switch and must abort.
     let releaseResume: () => void = () => {}
+
+    let markResumeStarted: () => void = () => {}
+
+    const resumeStarted = new Promise<void>(resolve => {
+      markResumeStarted = resolve
+    })
+
     const calls: { method: string; params?: Record<string, unknown> }[] = []
 
     const selectedStoredSessionIdRef: MutableRefObject<string | null> = { current: STORED_ID }
@@ -4905,6 +5011,7 @@ describe('usePromptActions busy-gateway churn tolerance (#64327)', () => {
       if (method === 'session.resume') {
         await new Promise<void>(resolve => {
           releaseResume = resolve
+          markResumeStarted()
         })
 
         return { session_id: RESUMED_RUNTIME_ID } as never
@@ -4914,7 +5021,7 @@ describe('usePromptActions busy-gateway churn tolerance (#64327)', () => {
     })
 
     let handle: HarnessHandle | null = null
-    render(
+    await actRender(
       <Harness
         activeSessionId={null}
         activeSessionIdRef={activeSessionIdRef}
@@ -4926,18 +5033,21 @@ describe('usePromptActions busy-gateway churn tolerance (#64327)', () => {
         storedSessionId={STORED_ID}
       />
     )
-    await waitFor(() => expect(handle).not.toBeNull())
 
-    const submitting = handle!.submitText('must not land in the other chat')
-    await waitFor(() => expect(calls.some(c => c.method === 'session.resume')).toBe(true))
+    let submitted = true
+    await act(async () => {
+      const submitting = handle!.submitTextRaw('must not land in the other chat')
+      await resumeStarted
 
-    // A genuine switch: the user clicks another chat, which retargets
-    // selection and route synchronously.
-    selectedStoredSessionIdRef.current = 'stored-other-chat'
-    routeToken = '/stored-other-chat::'
-    releaseResume()
+      // A genuine switch: the user clicks another chat, which retargets
+      // selection and route synchronously.
+      selectedStoredSessionIdRef.current = 'stored-other-chat'
+      routeToken = '/stored-other-chat::'
+      releaseResume()
+      submitted = await submitting
+    })
 
-    expect(await submitting).toBe(false)
+    expect(submitted).toBe(false)
     expect(calls.some(c => c.method === 'prompt.submit')).toBe(false)
   })
 })

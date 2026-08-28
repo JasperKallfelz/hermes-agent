@@ -149,6 +149,25 @@ class TestBusySessionAck:
         agent.interrupt.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_pi_queue_mode_uses_durable_gateway_queue_exactly_once(self):
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "queue"
+        adapter = _make_adapter()
+        event = _make_event(text="native follow-up")
+        sk = build_session_key(event.source)
+        runner.adapters[event.source.platform] = adapter
+        agent = MagicMock(api_mode="pi_rpc")
+        runner._running_agents[sk] = agent
+
+        with patch.object(runner, "_queue_or_replace_pending_event") as queued:
+            handled = await runner._handle_active_session_busy_message(event, sk)
+
+        assert handled is True
+        agent.follow_up.assert_not_called()
+        queued.assert_called_once_with(sk, event)
+        agent.interrupt.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_sends_ack_when_agent_running(self):
         """First message during busy session should get a status ack."""
         runner, sentinel = _make_runner()
@@ -469,5 +488,3 @@ class TestLongRunningNotificationOwnership:
         assert runner._should_emit_long_running_notification(
             "sess", original_agent, executor_task=None
         ) is False
-
-

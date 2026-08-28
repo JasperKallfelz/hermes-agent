@@ -13,8 +13,11 @@ import threading
 import time
 import types
 
+import pytest
+
 import tools.async_delegation as ad
 from tui_gateway import server
+from tui_gateway.host_supervisor import HostSupervisor
 
 
 def _session(agent=None, **extra):
@@ -498,6 +501,31 @@ def test_busy_steer_fallthrough_burst_drains_all_texts_fifo(monkeypatch):
     for text in ("msg A", "msg B", "msg C"):
         assert text in joined, f"burst message dropped: {text!r}"
 
+def test_busy_pi_queue_uses_durable_hermes_queue_exactly_once(monkeypatch):
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "queue")
+    seen = []
+    agent = types.SimpleNamespace(
+        api_mode="pi_rpc", follow_up=lambda text: seen.append(text) or True,
+    )
+    session = _session(agent=agent, running=True)
+
+    response = server._handle_busy_submit("r1", "sid", session, "native next", "ws-1")
+
+    assert response["result"] == {"status": "queued"}
+    assert seen == []
+    assert session["queued_prompt"]["text"] == "native next"
+
+
+def test_busy_pi_follow_up_failure_falls_back_to_existing_queue(monkeypatch):
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "queue")
+    agent = types.SimpleNamespace(api_mode="pi_rpc", follow_up=lambda _text: False)
+    session = _session(agent=agent, running=True)
+
+    response = server._handle_busy_submit("r1", "sid", session, "safe fallback", "ws-1")
+
+    assert response["result"]["status"] == "queued"
+    assert session["queued_prompt"]["text"] == "safe fallback"
+
 
 
 
@@ -687,6 +715,8 @@ def test_drain_releases_running_on_dispatch_failure(monkeypatch):
     assert server._drain_queued_prompt("r1", "sid", session) is True
     # Failure must not leave the session wedged as running.
     assert session["running"] is False
+    assert session["queued_prompt"] == {"text": "go", "transport": None}
+    assert session.get("_queued_prompt_inflight") is None
 
 
 def test_drain_does_not_dispatch_a_prompt_cancelled_after_claim(monkeypatch):
@@ -760,14 +790,13 @@ def test_drain_does_not_clear_stop_after_its_final_generation_check(monkeypatch)
     assert session["running"] is False
 
 
-def test_drain_continues_with_later_queued_prompt_after_dispatch_failure(monkeypatch):
+def test_drain_restores_failed_claim_ahead_of_later_fifo_prompt(monkeypatch):
     calls = []
 
     def _run(_rid, _sid, session, text, **_kwargs):
         calls.append(text)
         if text == "broken":
             raise RuntimeError("dispatch failed")
-        session["running"] = False
 
     monkeypatch.setattr(server, "_run_prompt_submit", _run)
     session = _session(
@@ -776,7 +805,243 @@ def test_drain_continues_with_later_queued_prompt_after_dispatch_failure(monkeyp
     )
 
     assert server._drain_queued_prompt("r1", "sid", session) is True
-    assert calls == ["broken", "next"]
-    assert session["queued_prompt"] is None
+    assert calls == ["broken"]
+    assert session["queued_prompt"] == {"text": "broken", "transport": None}
+    assert session["queued_prompts"] == [
+        {"text": "next", "image_paths": ["/tmp/next.png"], "transport": None}
+    ]
+
+
+def test_busy_arrival_during_failed_claim_stays_behind_restored_fifo_head(monkeypatch):
+    session = _session(
+        queued_prompt={"text": "B", "transport": "ws"},
+        queued_prompts=[{"text": "C", "transport": "ws", "image_paths": ["/tmp/c.png"]}],
+    )
+
+    def fail_after_new_arrival(*_args, **_kwargs):
+        server._enqueue_prompt(session, "D", "ws", image_paths=["/tmp/d.png"])
+        raise RuntimeError("preaccept")
+
+    monkeypatch.setattr(server, "_run_prompt_submit", fail_after_new_arrival)
+    assert server._drain_queued_prompt("r", "sid", session) is True
+    assert session["queued_prompt"]["text"] == "B"
+    assert [item["text"] for item in session["queued_prompts"]] == ["C", "D"]
+
+
+def test_compute_dispatch_error_retains_identity_and_never_requeues(monkeypatch):
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda _session: True)
+    monkeypatch.setattr(
+        server,
+        "_submit_prompt_to_compute_host",
+        lambda *_args, **_kwargs: {
+            "error": {"code": 5019, "message": "pipe flush uncertain"}
+        },
+    )
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    session = _session(queued_prompt={"text": "once", "transport": None})
+    assert server._drain_queued_prompt("r", "sid", session) is True
+    assert session.get("queued_prompt") is None
+    assert session["_queued_prompt_inflight"]["status"] == "dispatch_uncertain"
+    assert session["_queued_prompt_inflight"]["prompt"]["text"] == "once"
+
+
+def test_safe_pre_send_compute_failure_falls_back_inline_once_in_fifo_order(
+    monkeypatch,
+):
+    host_calls = []
+    inline_calls = []
+    session = _session(
+        queued_prompt={
+            "text": "B",
+            "image_paths": ["/tmp/b.png"],
+            "transport": "ws",
+        },
+        queued_prompts=[{"text": "C", "transport": "ws"}],
+    )
+
+    def safe_pre_send(_rid, _sid, _session, text, **kwargs):
+        host_calls.append((text, kwargs))
+        return {
+            "error": {
+                "code": 5019,
+                "message": "host never accepted prompt",
+                "data": {
+                    "phase": "before_send",
+                    "prompt_accepted": False,
+                    "reconciliation_required": False,
+                },
+            }
+        }
+
+    def inline(_rid, _sid, current, text, **kwargs):
+        claim = current.get("_queued_prompt_inflight")
+        assert claim is not None and claim["status"] == "inline_fallback"
+        inline_calls.append((text, kwargs))
+        if text == "B":
+            server._enqueue_prompt(
+                current, "D", "ws", image_paths=["/tmp/d.png"]
+            )
+
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda _session: True)
+    monkeypatch.setattr(server, "_submit_prompt_to_compute_host", safe_pre_send)
+    monkeypatch.setattr(server, "_run_prompt_submit", inline)
+
+    for expected in ("B", "C", "D"):
+        assert server._drain_queued_prompt("r", "sid", session) is True
+        assert inline_calls[-1][0] == expected
+        assert session.get("_queued_prompt_inflight") is None
+        session["running"] = False
+
+    assert [text for text, _kwargs in host_calls] == ["B", "C", "D"]
+    assert inline_calls == [
+        (
+            "B",
+            {
+                "image_paths": ["/tmp/b.png"],
+                "queued_prompt_generation": 0,
+            },
+        ),
+        ("C", {"queued_prompt_generation": 0}),
+        (
+            "D",
+            {
+                "image_paths": ["/tmp/d.png"],
+                "queued_prompt_generation": 0,
+            },
+        ),
+    ]
+    assert session.get("queued_prompt") is None
     assert session.get("queued_prompts") is None
 
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {
+            "phase": "before_send",
+            "prompt_accepted": None,
+            "reconciliation_required": True,
+        },
+        {
+            "phase": "before_send",
+            "prompt_accepted": True,
+            "reconciliation_required": True,
+        },
+        {
+            "phase": "after_send",
+            "prompt_accepted": False,
+            "reconciliation_required": False,
+        },
+        {
+            "phase": "before_send",
+            "prompt_accepted": False,
+            "reconciliation_required": True,
+        },
+    ],
+)
+def test_non_proven_compute_failures_remain_uncertain_and_never_replay(
+    monkeypatch, data
+):
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda _session: True)
+    monkeypatch.setattr(
+        server,
+        "_submit_prompt_to_compute_host",
+        lambda *_args, **_kwargs: {
+            "error": {"code": 5019, "message": "uncertain", "data": data}
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("uncertain dispatch must never replay inline")
+        ),
+    )
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    session = _session(queued_prompt={"text": "once", "transport": None})
+
+    assert server._drain_queued_prompt("r", "sid", session) is True
+    assert session.get("queued_prompt") is None
+    assert session["_queued_prompt_inflight"]["status"] == "dispatch_uncertain"
+    assert session["_queued_prompt_inflight"]["prompt"]["text"] == "once"
+
+
+def test_uncertain_queued_dispatch_blocks_later_prompt_fail_closed(monkeypatch):
+    session = _session(
+        _queued_prompt_inflight={
+            "dispatch_id": "queued-fixed",
+            "generation": 0,
+            "prompt": {"text": "possibly accepted", "transport": None},
+            "status": "dispatch_uncertain",
+        }
+    )
+    monkeypatch.setattr(server, "_ensure_active_session_slot", lambda *_args: None)
+    server._sessions["uncertain"] = session
+    try:
+        response = server._methods["prompt.submit"](
+            "later", {"session_id": "uncertain", "text": "do not overtake"}
+        )
+    finally:
+        server._sessions.pop("uncertain", None)
+    assert response["error"]["code"] == 4091
+    assert session["_queued_prompt_inflight"]["dispatch_id"] == "queued-fixed"
+
+
+@pytest.mark.parametrize("failure", ["flush", "partial"])
+def test_public_initial_compute_dispatch_uncertainty_never_replays_inline(
+    monkeypatch, tmp_path, failure
+):
+    writes: list[str] = []
+
+    class Stdin:
+        def write(self, payload: str) -> int:
+            writes.append(payload)
+            if failure == "partial":
+                return max(1, len(payload) // 2)
+            return len(payload)
+
+        def flush(self) -> None:
+            if failure == "flush":
+                raise BrokenPipeError("flush failed")
+
+    class Proc:
+        stdin = Stdin()
+
+        @staticmethod
+        def poll():
+            return None
+
+    supervisor = HostSupervisor(
+        registry_path=tmp_path / "registry.json",
+        autostart=False,
+    )
+    supervisor._proc = Proc()
+    monkeypatch.setattr(supervisor, "start", lambda: None)
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda _session, _cfg=None: True)
+    monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda _cfg=None: supervisor)
+    monkeypatch.setattr(server, "_ensure_active_session_slot", lambda *_args: None)
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("an uncertain prompt must never run inline")
+        ),
+    )
+    session = _session(agent=None, agent_ready=threading.Event())
+    server._sessions["uncertain-initial"] = session
+    try:
+        response = server._methods["prompt.submit"](
+            "dispatch-once",
+            {"session_id": "uncertain-initial", "text": "execute once"},
+        )
+    finally:
+        server._sessions.pop("uncertain-initial", None)
+
+    assert response["result"]["status"] == "reconciliation_required"
+    assert response["result"]["prompt_accepted"] is None
+    assert response["result"]["reconciliation_required"] is True
+    assert writes and '"text":"execute once"' in writes[0]
+    claim = session["_compute_host_dispatch_inflight"]
+    assert claim["dispatch_id"] == "dispatch-once"
+    assert claim["status"] == "dispatch_uncertain"
+    assert "dispatch-once" in supervisor._pending_turns

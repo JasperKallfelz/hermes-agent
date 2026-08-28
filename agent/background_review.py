@@ -24,7 +24,7 @@ import logging
 import os
 from pathlib import Path
 import threading
-from typing import Any, Dict, List, Optional
+from typing import Any, cast, Dict, List, Optional
 
 from agent.thread_scoped_output import thread_scoped_silence
 
@@ -353,8 +353,17 @@ def _resolve_review_runtime(
     task_base_url = (str(task.get("base_url", "")).strip() or None)
     task_api_key = (str(task.get("api_key", "")).strip() or None)
     if not (task_provider and task_provider != "auto" and task_model):
+        if parent_api_mode == "pi_rpc":
+            raise RuntimeError(
+                "Pi background review requires an explicit Hermes-native "
+                "auxiliary.background_review provider and model"
+            )
         return parent
-    if task_provider == (agent.provider or "") and task_model == (agent.model or ""):
+    if (
+        parent_api_mode != "pi_rpc"
+        and task_provider == (agent.provider or "")
+        and task_model == (agent.model or "")
+    ):
         return parent  # same model/provider as parent -> not routed
     try:
         from hermes_cli.runtime_provider import resolve_runtime_provider
@@ -364,6 +373,10 @@ def _resolve_review_runtime(
             explicit_api_key=task_api_key,
             explicit_base_url=task_base_url,
         )
+        if rp.get("api_mode") == "pi_rpc":
+            raise RuntimeError(
+                "auxiliary provider resolution returned the main-agent Pi runtime"
+            )
         return {
             "provider": rp.get("provider") or task_provider,
             "model": rp.get("model") or task_model,
@@ -378,6 +391,10 @@ def _resolve_review_runtime(
             "routed": True,
         }
     except Exception as e:
+        if parent_api_mode == "pi_rpc":
+            raise RuntimeError(
+                f"Pi background review Hermes-native route failed: {e}"
+            ) from e
         logger.debug("background-review aux routing failed (%s); using main model", e)
         return parent
 
@@ -1296,7 +1313,12 @@ def _run_review_in_thread(
                     _pref_val = getattr(agent, _pref_attr, None)
                     if _pref_val:
                         _fork_kwargs[_pref_attr] = _pref_val
-            review_agent = AIAgent(
+            # AIAgent's legacy runtime signature intentionally accepts None
+            # despite non-Optional annotations, and this fork sets several
+            # runtime-owned attributes after construction. Keep the dynamic
+            # boundary explicit instead of teaching the narrow review module
+            # an incomplete structural model of the god-class.
+            review_agent = cast(Any, AIAgent)(
                 model=_rt.get("model") or agent.model,
                 max_iterations=_REVIEW_MAX_ITERATIONS,
                 quiet_mode=True,

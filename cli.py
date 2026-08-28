@@ -9261,6 +9261,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         provider = getattr(self, "provider", None) or "unknown"
         model = getattr(self, "model", None) or "(unknown)"
         is_running = bool(getattr(self, "_agent_running", False))
+        runtime = getattr(agent, "api_mode", None) if agent else "hermes"
+        pi_session = getattr(agent, "_pi_rpc_session", None) if agent else None
+        pi_state = pi_session._runtime_state() if runtime == "pi_rpc" and pi_session else None
 
         # Reasoning level (C-02): resolve the effective effort for display.
         reasoning_label = None
@@ -9321,6 +9324,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             lines.append(f"Approvals: {approval_label}")
         if ctx_label:
             lines.append(f"Context: {ctx_label}")
+        if runtime == "pi_rpc":
+            lines.append(
+                (
+                    f"Runtime: pi · Model: {pi_state.model_provider or 'unknown'}/"
+                    f"{pi_state.model_id or 'unknown'} · Thinking: {pi_state.thinking_level or 'off'} · "
+                    f"Native Session: {pi_state.session_id or 'starting'}"
+                )
+                if pi_state
+                else "Runtime: pi · Native Session: not started"
+            )
         lines.extend([
             f"Created: {created_at.strftime('%Y-%m-%d %H:%M')}",
             f"Last Activity: {updated_at.strftime('%Y-%m-%d %H:%M')}",
@@ -11474,6 +11487,49 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         config.yaml, default False — switches are session-scoped). Use
         ``--global`` to persist, or ``--once`` for the next turn only.
         """
+        pi_mode = bool(self.agent and getattr(self.agent, "api_mode", None) == "pi_rpc")
+        if pi_mode:
+            try:
+                from agent.pi_runtime import (
+                    get_or_create_pi_session,
+                    parse_pi_model_selection,
+                    select_pi_model,
+                )
+                from hermes_cli.model_switch import parse_model_switch_args
+
+                session = get_or_create_pi_session(self.agent)
+                session.ensure_started()
+            except Exception as exc:
+                _cprint(f"  ✗ Pi model catalog unavailable: {exc}")
+                return
+            raw = cmd_original.split(None, 1)[1].strip() if len(cmd_original.split(None, 1)) > 1 else ""
+            request = parse_model_switch_args(raw)
+            if request.errors:
+                _cprint(f"  ✗ {request.error_messages()[0]}")
+                return
+            if not request.target and not request.explicit_provider:
+                models = session.available_models()
+                if not models:
+                    _cprint("  Pi reports no configured models. Authenticate Pi separately, then retry.")
+                for model in models:
+                    provider = model.get("provider") or "unknown"
+                    model_id = model.get("id") or model.get("model") or "unknown"
+                    _cprint(f"  {provider}/{model_id}")
+                return
+            if request.is_global or request.is_once:
+                _cprint("  ✗ Pi model selection is scoped to its native session")
+                return
+            try:
+                provider, model_id = parse_pi_model_selection(
+                    request.target, request.explicit_provider
+                )
+                state = select_pi_model(self.agent, provider, model_id)
+            except Exception as exc:
+                _cprint(f"  ✗ Pi model control failed: {exc}")
+                return
+            _cprint(f"  ✓ runtime=pi · model={state.model_provider}/{state.model_id} · thinking={state.thinking_level or 'default'}")
+            return
+
         from hermes_cli.model_switch import (
             switch_model,
             parse_model_switch_args,
@@ -11808,6 +11864,35 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     else f"    {line}")
         if result.success and result.requires_new_session:
             _cprint("    Tip: `/reset` starts a new session immediately.")
+
+    def _handle_runtime(self, cmd_original: str) -> None:
+        from hermes_cli import runtime_switch
+        from hermes_cli.config import load_config, save_config
+        raw = cmd_original.split(None, 1)[1] if len(cmd_original.split(None, 1)) > 1 else ""
+        reconcile_parts = raw.strip().lower().split()
+        if reconcile_parts[:1] == ["reconcile"]:
+            if len(reconcile_parts) != 2 or reconcile_parts[1] not in {"inspect", "adopt", "abandon"}:
+                _cprint("❌ Usage: /runtime reconcile inspect|adopt|abandon")
+                return
+            try:
+                from agent.pi_runtime import (
+                    format_pi_reconciliation_report,
+                    reconcile_pi_agent,
+                )
+
+                report = reconcile_pi_agent(self.agent, reconcile_parts[1])
+                _cprint("✓ " + format_pi_reconciliation_report(report))
+            except Exception as exc:
+                _cprint(f"✗ Pi reconciliation failed: {exc}")
+            return
+        value, errors = runtime_switch.parse_args(raw)
+        if errors:
+            _cprint("❌ " + "\n❌ ".join(errors)); return
+        result = runtime_switch.apply(load_config(), value,
+                                      persist_callback=save_config if value is not None else None)
+        _cprint(("✓ " if result.success else "✗ ") + result.message)
+        if result.requires_new_session:
+            _cprint("    Start a fresh session with `/new` to apply it.")
 
     def _should_handle_model_command_inline(self, text: str, has_images: bool = False) -> bool:
         """Return True when /model should be handled immediately on the UI thread."""
@@ -12250,6 +12335,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._handle_model_switch(cmd_original)
         elif canonical == "codex-runtime":
             self._handle_codex_runtime(cmd_original)
+        elif canonical == "runtime":
+            self._handle_runtime(cmd_original)
 
         elif canonical == "personality":
             # Use original case (handler lowercases the personality name itself)
@@ -18170,7 +18257,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                             else:
                                 _effective_mode = "queue"
                     if _effective_mode == "queue":
-                        # Queue for the next turn instead of interrupting
+                        # Pi 0.84.3 cannot atomically reject an idle native
+                        # follow-up. Retain the durable Hermes FIFO exactly once.
                         self._pending_input.put(payload)
                         preview = text if text else f"[{len(images)} image{'s' if len(images) != 1 else ''} attached]"
                         _cprint(f"  Queued for the next turn: {preview[:80]}{'...' if len(preview) > 80 else ''}")

@@ -1,0 +1,8 @@
+{
+  "name": "hermes-pi-runtime",
+  "version": "0.84.3",
+  "private": true,
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "0.84.3"
+  }
+}

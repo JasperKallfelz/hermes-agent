@@ -5,8 +5,8 @@ from __future__ import annotations
 import logging
 import os
 import re
-from urllib.parse import urlparse
 from typing import Any, Dict, Optional
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +70,8 @@ def get_compatible_custom_providers(config=None):
 def normalize_extra_headers(value):
     """Late-bound delegate — see :func:`load_config` for why."""
     return _config_mod.normalize_extra_headers(value)
+
+
 from utils import base_url_host_matches, base_url_hostname, env_int
 
 
@@ -478,11 +480,19 @@ def _maybe_apply_codex_app_server_runtime(
     rerouted through codex.
 
     Returns the (possibly-rewritten) api_mode."""
-    if not model_cfg:
+    model_cfg = model_cfg or {}
+    runtime = str(model_cfg.get("openai_runtime") or "").strip().lower()
+    try:
+        agent_config = load_config().get("agent") or {}
+        agent_runtime = str(agent_config.get("runtime") or "").strip().lower()
+    except Exception:
+        agent_runtime = ""
+    if agent_runtime in {"hermes", "pi_rpc"}:
         return api_mode
+    if agent_runtime == "codex_app_server":
+        runtime = "codex_app_server"
     if provider not in {"openai", "openai-codex"}:
         return api_mode
-    runtime = str(model_cfg.get("openai_runtime") or "").strip().lower()
     if runtime == "codex_app_server":
         return "codex_app_server"
     return api_mode
@@ -851,7 +861,7 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
         provider_key = str(entry.get("provider_key", "") or "").strip()
         if requested_norm not in custom_provider_aliases(name, provider_key):
             continue
-        result = {
+        result: Dict[str, Any] = {
             "name": name.strip(),
             "base_url": base_url.strip(),
             "api_key": str(entry.get("api_key", "") or "").strip(),
@@ -1354,8 +1364,10 @@ def _resolve_openrouter_runtime(
     explicit_base_url: Optional[str] = None,
 ) -> Dict[str, Any]:
     model_cfg = _get_model_config()
-    cfg_base_url = model_cfg.get("base_url") if isinstance(model_cfg.get("base_url"), str) else ""
-    cfg_provider = model_cfg.get("provider") if isinstance(model_cfg.get("provider"), str) else ""
+    raw_cfg_base_url = model_cfg.get("base_url")
+    cfg_base_url: str = raw_cfg_base_url if isinstance(raw_cfg_base_url, str) else ""
+    raw_cfg_provider = model_cfg.get("provider")
+    cfg_provider: str = raw_cfg_provider if isinstance(raw_cfg_provider, str) else ""
     cfg_api_key = ""
     for k in ("api_key", "api"):
         v = model_cfg.get(k)
@@ -1860,7 +1872,7 @@ def resolve_runtime_provider(
     #
     # Fail fast with a typed error so the fallback chain can advance to
     # the next provider instead of using a disabled one.
-    from hermes_cli.config import is_provider_enabled, load_config
+    from hermes_cli.config import is_provider_enabled
     _full_cfg = load_config()
     _provs_cfg = _full_cfg.get("providers") if isinstance(_full_cfg, dict) else None
     if isinstance(_provs_cfg, dict):
@@ -2504,6 +2516,55 @@ def resolve_runtime_provider(
     )
     runtime["requested_provider"] = requested_provider
     return runtime
+
+
+def resolve_main_agent_runtime_provider(
+    *,
+    requested: Optional[str] = None,
+    explicit_api_key: Optional[str] = None,
+    explicit_base_url: Optional[str] = None,
+    target_model: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Resolve one top-level agent, applying the selected execution runtime.
+
+    Ordinary provider and auxiliary resolution must call
+    :func:`resolve_runtime_provider` and therefore always receives the real
+    inference wire mode. Pi is selected only at this explicit construction
+    boundary and does not require an otherwise-unused Hermes provider.
+    """
+    provider_kwargs: Dict[str, Any] = {
+        key: value
+        for key, value in {
+            "requested": requested,
+            "target_model": target_model,
+            "explicit_api_key": explicit_api_key,
+            "explicit_base_url": explicit_base_url,
+        }.items()
+        if value is not None
+    }
+
+    config = load_config()
+    agent_config = config.get("agent") if isinstance(config, dict) else {}
+    if not isinstance(agent_config, dict):
+        agent_config = {}
+    selected = str(agent_config.get("runtime") or "").strip().lower()
+    pi_config = agent_config.get("pi_rpc") or {}
+    if selected == "pi_rpc":
+        if not isinstance(pi_config, dict) or pi_config.get("enabled") is not True:
+            raise RuntimeError(
+                "agent.runtime=pi_rpc requires the explicit agent.pi_rpc.enabled gate"
+            )
+        return {
+            "provider": "pi",
+            "requested_provider": requested or "pi",
+            "api_mode": "pi_rpc",
+            "base_url": "pi-rpc://contained",
+            "api_key": "pi-runtime-no-hermes-provider",
+            "source": "agent.runtime",
+            "agent_runtime": "pi_rpc",
+        }
+
+    return dict(resolve_runtime_provider(**provider_kwargs))
 
 
 def format_runtime_provider_error(error: Exception) -> str:

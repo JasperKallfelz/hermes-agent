@@ -12362,7 +12362,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate", "moa",
         "journey", "memory-graph", "learning",
         "model", "monitoring", "pairing", "pause", "peer", "pets", "plugins", "portal", "profile",
-        "project", "proxy",
+        "project", "proxy", "pi-runtime",
         "prompt-size",
         "resume",
         "send", "sessions", "setup",
@@ -13408,6 +13408,12 @@ def main():
         return 0
 
     egress_parser.set_defaults(func=_dispatch_egress)
+
+    # =========================================================================
+    # pi-runtime command — pinned host installer and isolated auth launcher
+    # =========================================================================
+    from hermes_cli.pi_runtime_cli import register_cli as _register_pi_runtime_cli
+    _register_pi_runtime_cli(subparsers)
 
     # =========================================================================
     # migrate command

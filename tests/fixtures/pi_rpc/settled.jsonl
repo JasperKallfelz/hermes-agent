@@ -1,0 +1,7 @@
+{"id":"state-1","type":"response","command":"get_state","success":true,"data":{"sessionId":"fixture-session","sessionFile":"SESSION","thinkingLevel":"high","model":{"provider":"fixture","id":"fixture-model"}}}
+{"id":"entries-1","type":"response","command":"get_entries","success":true,"data":{"entries":[],"leafId":"leaf-1"}}
+{"type":"message_start"}
+{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"done"}}
+{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"done"}],"usage":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0,"cost":{"total":0}}}}
+{"type":"agent_end"}
+{"type":"agent_settled"}

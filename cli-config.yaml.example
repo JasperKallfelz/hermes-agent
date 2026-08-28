@@ -996,6 +996,22 @@ skills:
 # Agent Behavior
 # =============================================================================
 agent:
+  # Experimental external Pi RPC runtime (off by default). Every interactive
+  # Pi session is contained in Docker with a read-only workspace; implement
+  # mode is available only through coding_task in an isolated worktree. Build
+  # the reviewed image with agent/transports/pi_assets/build-image.sh and use
+  # the exact printed sha256:<64hex> image ID (or a repo@sha256 digest). Tags
+  # are rejected. Docker config/socket are never mounted into Pi.
+  # runtime: pi_rpc
+  # pi_rpc:
+  #   enabled: true
+  #   docker_image: sha256:<64 lowercase hex digits>
+  #   interactive_mode: inspect  # review, inspect, or plan; never implement
+  #   provider_env_allowlist: [] # credential names only; omit to forward none
+  #   # Exact selected-provider DNS names (optional :port), never URLs,
+  #   # IP literals, or wildcards. CONNECT also requires exact matching TLS SNI.
+  #   egress_allowlist: []
+
   # Maximum tool-calling iterations per conversation (default: 500)
   # Higher = more room for complex tasks, but costs more tokens
   # Recommended: 20-30 for focused tasks, 50-100 for open exploration

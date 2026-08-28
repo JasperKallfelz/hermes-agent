@@ -73,6 +73,57 @@ def make_agent_and_state():
     return acp_agent, state, fake, conn
 
 
+class FakePiAgent(FakeAgent):
+    def __init__(self):
+        super().__init__()
+        self.api_mode = "pi_rpc"
+        self._pi_rpc_session = object()
+
+
+def test_pi_model_slash_uses_existing_native_agent(monkeypatch):
+    fake = FakePiAgent()
+    manager = SessionManager(agent_factory=lambda **kwargs: fake, db=NoopDb())
+    acp_agent = HermesACPAgent(session_manager=manager)
+    state = manager.create_session(cwd=".")
+    selected = []
+    monkeypatch.setattr(
+        "agent.pi_runtime.select_pi_model",
+        lambda agent, provider, model: selected.append((agent, provider, model)),
+    )
+    result = acp_agent._cmd_model("openai/team/model", state)
+    assert selected == [(fake, "openai", "team/model")]
+    assert state.agent is fake
+    assert "team/model" in result
+
+
+def test_pi_reset_and_fork_refuse_without_mutating_history():
+    fake = FakePiAgent()
+    manager = SessionManager(agent_factory=lambda **kwargs: fake, db=NoopDb())
+    acp_agent = HermesACPAgent(session_manager=manager)
+    state = manager.create_session(cwd=".")
+    state.history = [{"role": "user", "content": "keep"}]
+    assert "unsupported for Pi RPC" in acp_agent._cmd_reset("", state)
+    assert state.history == [{"role": "user", "content": "keep"}]
+    with pytest.raises(RuntimeError, match="cannot be forked"):
+        manager.fork_session(state.session_id)
+
+
+@pytest.mark.asyncio
+async def test_pi_protocol_model_switch_keeps_exactly_one_agent(monkeypatch):
+    fake = FakePiAgent()
+    manager = SessionManager(agent_factory=lambda **kwargs: fake, db=NoopDb())
+    acp_agent = HermesACPAgent(session_manager=manager)
+    state = manager.create_session(cwd=".")
+    selected = []
+    monkeypatch.setattr(
+        "agent.pi_runtime.select_pi_model",
+        lambda agent, provider, model: selected.append((agent, provider, model)),
+    )
+    await acp_agent.set_session_model("anthropic:claude-sonnet", state.session_id)
+    assert selected == [(fake, "anthropic", "claude-sonnet")]
+    assert state.agent is fake
+
+
 def test_acp_real_agent_gets_session_db_for_recall(monkeypatch):
     """ACP sessions persist to SessionDB; recall must receive the same DB handle."""
     captured = {}
@@ -100,7 +151,7 @@ def test_acp_real_agent_gets_session_db_for_recall(monkeypatch):
         "hermes_cli.runtime_provider",
         mod(
             "hermes_cli.runtime_provider",
-            resolve_runtime_provider=lambda **_kwargs: {
+            resolve_main_agent_runtime_provider=lambda **_kwargs: {
                 "provider": "p",
                 "api_mode": "chat_completions",
                 "base_url": "u",
@@ -118,6 +169,40 @@ def test_acp_real_agent_gets_session_db_for_recall(monkeypatch):
     assert captured["session_db"] is sentinel_db
     assert captured["platform"] == "acp"
     assert captured["session_id"] == "acp-session"
+
+
+def test_acp_explicit_pi_gate_failure_is_not_swallowed(monkeypatch):
+    def mod(name, **attrs):
+        module = ModuleType(name)
+        for key, value in attrs.items():
+            setattr(module, key, value)
+        return module
+
+    monkeypatch.setitem(sys.modules, "run_agent", mod("run_agent", AIAgent=FakeAgent))
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.config",
+        mod(
+            "hermes_cli.config",
+            load_config=lambda: {
+                "agent": {"runtime": "pi_rpc", "pi_rpc": {"enabled": False}},
+                "model": {"default": "m", "provider": "p"},
+            },
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.runtime_provider",
+        mod(
+            "hermes_cli.runtime_provider",
+            resolve_main_agent_runtime_provider=lambda **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("explicit Pi gate rejected")
+            ),
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="explicit Pi gate rejected"):
+        SessionManager(db=NoopDb())._make_agent(session_id="acp-session", cwd=".")
 
 
 @pytest.mark.asyncio
@@ -161,9 +246,6 @@ async def test_acp_cancel_publishes_hard_stop_while_holding_runtime_lock():
     assert observed["lock_held"] is True
     assert state.cancel_event.is_set()
     assert state.interrupted_prompt_text == "original request"
-
-
-
 
 
 

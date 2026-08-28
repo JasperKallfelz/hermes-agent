@@ -11,6 +11,7 @@ import pytest
 from tui_gateway import compute_host, server
 from tui_gateway.compute_host import ComputeHost, _default_workers
 from tui_gateway.host_supervisor import (
+    ComputeHostDispatchError,
     MUTATOR_ROUTE_TABLE,
     HostSupervisor,
     append_log_record,
@@ -98,6 +99,65 @@ def test_supervisor_startup_reconcile_pid_reuse_guard(tmp_path, monkeypatch):
     assert result == "pid-reuse-ignored"
     assert killed == []
     assert not registry.exists()
+
+
+@pytest.mark.parametrize("failure", ["flush", "partial"])
+def test_submit_turn_retains_identity_when_pipe_acceptance_is_uncertain(
+    tmp_path, monkeypatch, failure
+):
+    written: list[str] = []
+
+    class Stdin:
+        def write(self, payload: str) -> int:
+            written.append(payload)
+            if failure == "partial":
+                return max(1, len(payload) // 2)
+            return len(payload)
+
+        def flush(self) -> None:
+            if failure == "flush":
+                raise BrokenPipeError("flush failed after write")
+
+    class Proc:
+        stdin = Stdin()
+
+        @staticmethod
+        def poll():
+            return None
+
+    supervisor = HostSupervisor(
+        registry_path=tmp_path / "registry.json",
+        autostart=False,
+    )
+    supervisor._proc = Proc()
+    monkeypatch.setattr(supervisor, "start", lambda: None)
+
+    with pytest.raises(ComputeHostDispatchError) as caught:
+        supervisor.submit_turn(
+            {"sid": "sid", "request_id": "dispatch-once", "text": "execute once"}
+        )
+
+    assert caught.value.prompt_accepted is None
+    assert caught.value.phase == "after_send_uncertain"
+    assert "dispatch-once" in supervisor._pending_turns
+    assert written and '"type":"turn.start"' in written[0]
+
+
+def test_submit_turn_proves_pre_send_only_before_write(tmp_path, monkeypatch):
+    supervisor = HostSupervisor(
+        registry_path=tmp_path / "registry.json",
+        autostart=False,
+    )
+    monkeypatch.setattr(supervisor, "start", lambda: None)
+
+    with pytest.raises(ComputeHostDispatchError) as caught:
+        supervisor.submit_turn(
+            {"sid": "sid", "request_id": "never-written", "text": "safe fallback"}
+        )
+
+    assert caught.value.prompt_accepted is False
+    assert caught.value.phase == "before_send"
+    assert "never-written" not in supervisor._pending_turns
 
 
 def _make_compress_host_session(events: list) -> dict:

@@ -2751,6 +2751,9 @@ def _(rid, params: dict) -> dict:
     usage = _session_usage_snapshot(session)
     provider = getattr(agent, "provider", None) or mirror.get("provider") or "unknown"
     model = getattr(agent, "model", None) or mirror.get("model") or "(unknown)"
+    runtime = getattr(agent, "api_mode", None) or "hermes"
+    pi_session = getattr(agent, "_pi_rpc_session", None)
+    pi_state = pi_session._runtime_state() if runtime == "pi_rpc" and pi_session else None
     project = _project_info_for_cwd(_display_session_cwd(session))
     lines = [
         "Hermes TUI Status",
@@ -2763,9 +2766,19 @@ def _(rid, params: dict) -> dict:
     title = (meta.get("title") or "").strip()
     if title:
         lines.append(f"Title: {title}")
+    lines.append(f"Model: {model} ({provider})")
+    if runtime == "pi_rpc":
+        lines.append(
+            (
+                f"Runtime: pi · Model: {pi_state.model_provider or 'unknown'}/"
+                f"{pi_state.model_id or 'unknown'} · Thinking: {pi_state.thinking_level or 'off'} · "
+                f"Native Session: {pi_state.session_id or 'starting'}"
+            )
+            if pi_state
+            else "Runtime: pi · Native Session: not started"
+        )
     lines.extend(
         [
-            f"Model: {model} ({provider})",
             f"Created: {created.strftime('%Y-%m-%d %H:%M')}",
             f"Last Activity: {updated.strftime('%Y-%m-%d %H:%M')}",
             f"Tokens: {int(usage.get('total') or 0):,}",

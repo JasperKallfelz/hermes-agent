@@ -49,6 +49,22 @@ _RESPAWN_WINDOW_SECS = 300.0
 _SHUTDOWN_TIMEOUT_SECS = 10.0
 
 
+class ComputeHostDispatchError(RuntimeError):
+    """A turn dispatch failed with explicit pipe-acceptance evidence."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        request_id: str,
+        prompt_accepted: bool | None,
+    ) -> None:
+        super().__init__(message)
+        self.request_id = request_id
+        self.prompt_accepted = prompt_accepted
+        self.phase = "before_send" if prompt_accepted is False else "after_send_uncertain"
+
+
 def append_log_record(path: str | Path, record: str) -> None:
     """Append one log record using O_APPEND and exactly one os.write call."""
     p = Path(path)
@@ -241,9 +257,14 @@ class HostSupervisor:
         *,
         on_complete: Callable[[dict], None] | None = None,
     ) -> str:
-        self.start()
         request_id = str(frame.get("request_id") or uuid.uuid4().hex)
         sid = str(frame.get("sid") or "")
+        try:
+            self.start()
+        except Exception as exc:
+            raise ComputeHostDispatchError(
+                str(exc), request_id=request_id, prompt_accepted=False
+            ) from exc
         payload = dict(frame)
         payload["type"] = "turn.start"
         payload["request_id"] = request_id
@@ -251,19 +272,19 @@ class HostSupervisor:
             self._pending_turns[request_id] = (sid, on_complete)
         try:
             self._send_frame(payload)
-        except Exception as exc:
-            with self._lock:
-                self._pending_turns.pop(request_id, None)
-            err = {
-                "type": "turn.error",
-                "sid": sid,
-                "request_id": request_id,
-                "reason": "send_failed",
-                "message": str(exc),
-            }
-            if on_complete is not None:
-                on_complete(err)
+        except ComputeHostDispatchError as exc:
+            # A positive pre-send failure is replay-safe and owns no pending
+            # turn. Once write() was attempted, retain the callback/identity:
+            # the full frame may already be executing in the child.
+            if exc.prompt_accepted is False:
+                with self._lock:
+                    self._pending_turns.pop(request_id, None)
             raise
+        except Exception as exc:
+            # Unknown lower-level send exceptions are conservative by default.
+            raise ComputeHostDispatchError(
+                str(exc), request_id=request_id, prompt_accepted=None
+            ) from exc
         return request_id
 
     def interrupt(self, sid: str, *, request_id: str | None = None) -> None:
@@ -389,9 +410,25 @@ class HostSupervisor:
         with self._lock:
             proc = self._proc
             if proc is None or proc.poll() is not None or proc.stdin is None:
-                raise RuntimeError("compute host is not running")
-            proc.stdin.write(json.dumps(frame, separators=(",", ":"), ensure_ascii=False) + "\n")
-            proc.stdin.flush()
+                raise ComputeHostDispatchError(
+                    "compute host is not running",
+                    request_id=str(frame.get("request_id") or ""),
+                    prompt_accepted=False,
+                )
+            encoded = json.dumps(frame, separators=(",", ":"), ensure_ascii=False) + "\n"
+            try:
+                written = proc.stdin.write(encoded)
+                if written is not None and written != len(encoded):
+                    raise OSError(
+                        f"compute host pipe accepted only {written} of {len(encoded)} characters"
+                    )
+                proc.stdin.flush()
+            except Exception as exc:
+                raise ComputeHostDispatchError(
+                    str(exc),
+                    request_id=str(frame.get("request_id") or ""),
+                    prompt_accepted=None,
+                ) from exc
 
     def _drain_stdout(self, proc: subprocess.Popen[str]) -> None:
         assert proc.stdout is not None

@@ -381,19 +381,17 @@ def test_prompt_submit_unknown_session_logs_warning(caplog):
     )
 
 
-def test_prompt_submit_fails_open_inline_when_compute_host_dispatch_breaks(monkeypatch):
-    class _BrokenSupervisor:
+def test_prompt_submit_falls_back_inline_only_for_proven_pre_send_failure(monkeypatch):
+    from tui_gateway.host_supervisor import ComputeHostDispatchError
+
+    class _NeverStartedSupervisor:
         def submit_turn(self, frame, *, on_complete=None):
-            if on_complete is not None:
-                on_complete(
-                    {
-                        "type": "turn.error",
-                        "request_id": frame["request_id"],
-                        "reason": "send_failed",
-                        "message": "broken pipe",
-                    }
-                )
-            raise BrokenPipeError("broken pipe")
+            _ = on_complete
+            raise ComputeHostDispatchError(
+                "host startup failed before write",
+                request_id=frame["request_id"],
+                prompt_accepted=False,
+            )
 
     class _ImmediateThread:
         def __init__(self, target=None, **_kwargs):
@@ -407,7 +405,7 @@ def test_prompt_submit_fails_open_inline_when_compute_host_dispatch_breaks(monke
     server._sessions["iso-fallback"] = session
     inline_calls = []
     monkeypatch.setattr(server, "_load_cfg", lambda: {"dashboard": {"turn_isolation": True}})
-    monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda _cfg=None: _BrokenSupervisor())
+    monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda _cfg=None: _NeverStartedSupervisor())
     monkeypatch.setattr(server, "_ensure_session_db_row", lambda _session: None)
     monkeypatch.setattr(server, "_persist_branch_seed", lambda _session: None)
     monkeypatch.setattr(server, "_start_agent_build", lambda _sid, _session: None)
@@ -458,6 +456,9 @@ def test_compute_host_turn_end_updates_metadata_mirror(monkeypatch):
     server._sessions["iso-sid"] = session
     emitted = []
     monkeypatch.setattr(server, "_emit", lambda event, sid, payload=None: emitted.append((event, sid, payload)))
+    monkeypatch.setattr(
+        "hermes_cli.banner.get_update_result", lambda timeout=0.5: 7
+    )
 
     try:
         server._on_compute_host_turn_done(
@@ -11011,6 +11012,9 @@ def test_commands_catalog_includes_desktop_meta_without_skills():
 
     commands = resp["result"]["commands"]
     assert commands["/review"] == {"argument_mode": "text", "desktop": None}
+    assert commands["/runtime"] == {"argument_mode": "options", "desktop": None}
+    assert commands["/reasoning"] == {"argument_mode": "options", "desktop": None}
+    assert commands["/thinking"] == commands["/reasoning"]
     assert commands["/clear"]["desktop"] == "terminal"
     assert commands["/model"]["desktop"] == "hidden"
     assert commands["/compact"]["argument_mode"] == commands["/compress"]["argument_mode"]
@@ -15491,6 +15495,10 @@ def test_model_options_preserves_canonical_custom_row_after_agent_init(monkeypat
     monkeypatch.setattr(
         "hermes_cli.auth.is_provider_explicitly_configured",
         lambda _slug: False,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.inventory._anthropic_oauth_credentials_present",
+        lambda: False,
     )
     monkeypatch.setattr("hermes_cli.inventory._apply_pricing", lambda *_args, **_kwargs: None)
     monkeypatch.setattr("hermes_cli.inventory._apply_capabilities", lambda *_args, **_kwargs: None)

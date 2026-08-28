@@ -62,15 +62,13 @@ def parse_args(arg_string: str) -> tuple[Optional[str], list[str]]:
 def get_current_runtime(config: dict) -> str:
     """Read the current `model.openai_runtime` value from a config dict.
     Returns 'auto' for unset / empty / unrecognized values."""
-    if not isinstance(config, dict):
-        return "auto"
-    model_cfg = config.get("model") or {}
-    if not isinstance(model_cfg, dict):
-        return "auto"
-    value = str(model_cfg.get("openai_runtime") or "").strip().lower()
-    if value in VALID_RUNTIMES:
-        return value
-    return "auto"
+    from hermes_cli.runtime_switch import get_current_runtime as get_neutral_runtime
+
+    return (
+        "codex_app_server"
+        if get_neutral_runtime(config) == "codex_app_server"
+        else "auto"
+    )
 
 
 def set_runtime(config: dict, new_value: str) -> str:
@@ -81,9 +79,12 @@ def set_runtime(config: dict, new_value: str) -> str:
             f"invalid runtime {new_value!r}; must be one of {VALID_RUNTIMES}"
         )
     old = get_current_runtime(config)
-    if not isinstance(config.get("model"), dict):
-        config["model"] = {}
-    config["model"]["openai_runtime"] = new_value
+    from hermes_cli.runtime_switch import set_runtime as set_neutral_runtime
+
+    set_neutral_runtime(
+        config,
+        "codex_app_server" if new_value == "codex_app_server" else "hermes",
+    )
     return old
 
 
@@ -115,6 +116,9 @@ def apply(
     Returns: CodexRuntimeStatus describing the outcome.
     """
     current = get_current_runtime(config)
+    from hermes_cli.runtime_switch import get_current_runtime as get_neutral_runtime
+
+    neutral_current = get_neutral_runtime(config)
 
     # Cache the codex binary check for this apply() call. Subprocess spawn
     # is cheap (~50ms for `codex --version`), but we'd otherwise call it up
@@ -133,7 +137,7 @@ def apply(
         ok, ver = _check_binary_cached()
         msg = (
             f"openai_runtime: {current}\n"
-            f"codex CLI: {'OK ' + ver if ok else 'not available — ' + (ver or 'install with `npm i -g @openai/codex`')}"
+            f"codex CLI: {'OK ' + (ver or 'unknown') if ok else 'not available — ' + (ver or 'install with `npm i -g @openai/codex`')}"
         )
         return CodexRuntimeStatus(
             success=True,
@@ -154,7 +158,11 @@ def apply(
     # idempotent by design (it replaces its own managed block in place), so
     # re-running is cheap and safe.
     reapplying_enable = new_value == current == "codex_app_server"
-    if new_value == current and not reapplying_enable:
+    if (
+        new_value == current
+        and not reapplying_enable
+        and neutral_current != "pi_rpc"
+    ):
         return CodexRuntimeStatus(
             success=True,
             new_value=current,

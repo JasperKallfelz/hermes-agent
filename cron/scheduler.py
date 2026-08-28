@@ -6030,8 +6030,9 @@ def run_job(
         pr = _cfg.get("provider_routing") or {}
 
         from hermes_cli.runtime_provider import (
-            resolve_runtime_provider,
             format_runtime_provider_error,
+            resolve_main_agent_runtime_provider,
+            resolve_runtime_provider,
         )
         from hermes_cli.auth import AuthError
 
@@ -6142,7 +6143,7 @@ def run_job(
             }
             if job.get("base_url"):
                 runtime_kwargs["explicit_base_url"] = job.get("base_url")
-            runtime = resolve_runtime_provider(**runtime_kwargs)
+            runtime = resolve_main_agent_runtime_provider(**runtime_kwargs)
             primary_provider_for_drift = (
                 str(runtime.get("provider") or "").strip().lower()
                 or primary_provider_for_drift

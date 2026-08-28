@@ -140,6 +140,14 @@ class TestSteerBusyPathDispatch:
         cli._pending_input.put.assert_called_once_with("would-be-next-turn")
 
 
+class TestPiQueueRouting:
+    def test_pi_does_not_expose_native_follow_up_frontend_route(self):
+        cli = _make_cli()
+        cli.agent = MagicMock(api_mode="pi_rpc")
+
+        assert not hasattr(cli, "_try_native_pi_follow_up")
+
+
 if __name__ == "__main__":  # pragma: no cover
     import pytest
 

@@ -451,6 +451,15 @@ py-modules = [
 include = ["agent", "agent.*", "tools", "tools.*", "hermes_cli", "hermes_cli.*", "gateway", "gateway.*", "tui_gateway", "tui_gateway.*", "cron", "cron.*", "acp_adapter", "plugins", "plugins.*", "providers", "providers.*"]
 
 [tool.setuptools.package-data]
+agent = [
+  "transports/pi_assets/*.ts",
+  "transports/pi_assets/Dockerfile",
+  "transports/pi_assets/*.sh",
+  "transports/pi_assets/*.py",
+  "transports/pi_assets/*.json",
+  "transports/pi_assets/*.txt",
+  "transports/pi_assets/*.in",
+]
 hermes_cli = ["observability/schemas/*.json", "data/*.json"]
 # gateway/assets/ ships status_phrases.yaml and the Telegram BotFather
 # screenshot. Without this, sealed venvs (uv2nix) silently lose both —

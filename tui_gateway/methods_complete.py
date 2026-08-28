@@ -473,6 +473,46 @@ def _(rid, params: dict) -> dict:
 
         session = _sessions.get(params.get("session_id", ""))
         agent = session.get("agent") if session else None
+        if agent is not None and getattr(agent, "api_mode", None) == "pi_rpc":
+            from agent.pi_runtime import get_or_create_pi_session
+
+            pi_session = get_or_create_pi_session(agent)
+            models = pi_session.available_models()
+            state = pi_session.get_state()
+            grouped: dict[str, list[str]] = {}
+            for item in models:
+                if not isinstance(item, dict):
+                    continue
+                provider = str(item.get("provider") or "").strip()
+                model_id = str(item.get("id") or item.get("modelId") or "").strip()
+                if provider and model_id:
+                    grouped.setdefault(provider, []).append(model_id)
+            providers = []
+            for provider, model_ids in sorted(grouped.items())[:50]:
+                unique = sorted(set(model_ids))
+                providers.append(
+                    {
+                        "slug": provider,
+                        "name": provider,
+                        "is_current": provider == state.model_provider,
+                        "models": unique[:200],
+                        "total_models": len(unique),
+                        "authenticated": True,
+                        "runtime": "pi_rpc",
+                    }
+                )
+            ok_response = globals().get("_ok")
+            if not callable(ok_response):
+                raise RuntimeError("TUI gateway response helper is unavailable")
+            return ok_response(
+                rid,
+                {
+                    "model": state.model_id or "",
+                    "provider": state.model_provider or "",
+                    "providers": providers,
+                    "runtime": "pi_rpc",
+                },
+            )
         # Layer agent-session state on top of disk config — once an agent
         # is spawned, IT owns the live provider/model/base_url. Empty
         # agent attributes must NOT clobber disk config (with_overrides

@@ -2826,14 +2826,14 @@ def _resolve_runtime_agent_kwargs() -> dict:
     before giving up.
     """
     from hermes_cli.runtime_provider import (
-        resolve_runtime_provider,
         format_runtime_provider_error,
         _get_model_config,
+        resolve_main_agent_runtime_provider,
     )
     from hermes_cli.auth import AuthError, is_rate_limited_auth_error
 
     try:
-        runtime = resolve_runtime_provider()
+        runtime = resolve_main_agent_runtime_provider()
     except AuthError as auth_exc:
         # Distinguish a transient rate-limit/quota cap (credentials are fine,
         # re-auth cannot help) from a genuine auth failure (expired/revoked
@@ -3003,11 +3003,11 @@ def _resolve_gateway_model_context(model: Optional[str] = None) -> _GatewayModel
 def _resolve_runtime_agent_kwargs_for_provider(provider: str) -> dict:
     """Resolve runtime credentials for a specific provider (e.g. from channel override)."""
     from hermes_cli.runtime_provider import (
-        resolve_runtime_provider,
         format_runtime_provider_error,
+        resolve_main_agent_runtime_provider,
     )
     try:
-        runtime = resolve_runtime_provider(requested=provider)
+        runtime = resolve_main_agent_runtime_provider(requested=provider)
     except Exception as exc:
         raise RuntimeError(format_runtime_provider_error(exc)) from exc
     return {
@@ -3056,6 +3056,7 @@ def _try_resolve_fallback_provider() -> dict | None:
 
                 runtime = resolve_runtime_provider(
                     requested=entry.get("provider"),
+                    target_model=entry.get("model"),
                     explicit_base_url=entry.get("base_url"),
                     explicit_api_key=resolve_entry_api_key(entry),
                 )
@@ -18186,6 +18187,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "codex-runtime":
             return await self._handle_codex_runtime_command(event)
+        if canonical == "runtime":
+            runtime_handler = getattr(self, "_handle_runtime_command")
+            return await runtime_handler(event)
 
         if canonical == "personality":
             return await self._handle_personality_command(event)

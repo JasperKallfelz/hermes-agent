@@ -1721,6 +1721,12 @@ class HermesACPAgent(acp.Agent):
         mcp_servers: list | None = None,
         **kwargs: Any,
     ) -> ForkSessionResponse:
+        original = self.session_manager.get_session(session_id)
+        if original is not None and getattr(original.agent, "api_mode", None) == "pi_rpc":
+            raise RuntimeError(
+                "ACP fork is unsupported for Pi RPC because Pi 0.84.3 cannot "
+                "faithfully fork its native context"
+            )
         state = self.session_manager.fork_session(session_id, cwd=cwd)
         new_id = state.session_id if state else ""
         if state is not None:
@@ -2329,15 +2335,41 @@ class HermesACPAgent(acp.Agent):
             return f"Current model: {model}\nProvider: {provider}"
 
         current_provider = getattr(state.agent, "provider", None) or "openrouter"
+        if getattr(state.agent, "api_mode", None) == "pi_rpc":
+            from agent.pi_runtime import parse_pi_model_selection, select_pi_model
+
+            try:
+                target_provider, new_model = parse_pi_model_selection(args)
+            except ValueError:
+                target_provider, new_model = self._resolve_model_selection(
+                    args, current_provider,
+                )
+            select_pi_model(state.agent, target_provider, new_model)
+            state.model = new_model
+            self.session_manager.save_session(state.session_id)
+            return f"Model switched to: {new_model}\nProvider: {target_provider}"
+        if state.is_running:
+            return "Cannot switch models while the ACP session is active."
         target_provider, new_model = self._resolve_model_selection(args, current_provider)
 
-        state.model = new_model
-        state.agent = self.session_manager._make_agent(
+        old_agent = state.agent
+        replacement = self.session_manager._make_agent(
             session_id=state.session_id,
             cwd=state.cwd,
             model=new_model,
             requested_provider=target_provider,
         )
+        close = getattr(old_agent, "close", None)
+        try:
+            if callable(close):
+                close()
+        except Exception:
+            replacement_close = getattr(replacement, "close", None)
+            if callable(replacement_close):
+                replacement_close()
+            raise
+        state.agent = replacement
+        state.model = new_model
         self.session_manager.save_session(state.session_id)
         provider_label = getattr(state.agent, "provider", None) or target_provider or current_provider
         logger.info("Session %s: model switched to %s", state.session_id, new_model)
@@ -2464,6 +2496,11 @@ class HermesACPAgent(acp.Agent):
         return "\n".join(lines)
 
     def _cmd_reset(self, args: str, state: SessionState) -> str:
+        if getattr(state.agent, "api_mode", None) == "pi_rpc":
+            return (
+                "Reset is unsupported for Pi RPC: Pi 0.84.3 cannot reset its "
+                "native context without diverging from Hermes history."
+            )
         state.history.clear()
         reset_failed = False
         try:
@@ -2573,16 +2610,29 @@ class HermesACPAgent(acp.Agent):
         """Switch the model for a session (called by ACP protocol)."""
         state = self.session_manager.get_session(session_id)
         if state:
+            if state.is_running:
+                raise RuntimeError("cannot switch models while the ACP session is active")
             current_provider = getattr(state.agent, "provider", None)
             requested_provider, resolved_model = self._resolve_model_selection(
                 model_id,
                 current_provider or "openrouter",
             )
-            state.model = resolved_model
+            if getattr(state.agent, "api_mode", None) == "pi_rpc":
+                from agent.pi_runtime import parse_pi_model_selection, select_pi_model
+
+                try:
+                    requested_provider, resolved_model = parse_pi_model_selection(model_id)
+                except ValueError:
+                    pass
+                select_pi_model(state.agent, requested_provider, resolved_model)
+                state.model = resolved_model
+                self.session_manager.save_session(session_id)
+                return SetSessionModelResponse()
             provider_changed = bool(current_provider and requested_provider != current_provider)
             current_base_url = None if provider_changed else getattr(state.agent, "base_url", None)
             current_api_mode = None if provider_changed else getattr(state.agent, "api_mode", None)
-            state.agent = self.session_manager._make_agent(
+            old_agent = state.agent
+            replacement = self.session_manager._make_agent(
                 session_id=session_id,
                 cwd=state.cwd,
                 model=resolved_model,
@@ -2590,6 +2640,17 @@ class HermesACPAgent(acp.Agent):
                 base_url=current_base_url,
                 api_mode=current_api_mode,
             )
+            close = getattr(old_agent, "close", None)
+            try:
+                if callable(close):
+                    close()
+            except Exception:
+                replacement_close = getattr(replacement, "close", None)
+                if callable(replacement_close):
+                    replacement_close()
+                raise
+            state.agent = replacement
+            state.model = resolved_model
             self.session_manager.save_session(session_id)
             logger.info(
                 "Session %s: model switched to %s via provider %s",

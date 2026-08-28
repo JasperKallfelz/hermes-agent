@@ -157,6 +157,23 @@ echo "  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env)"
 
 cd "$REPO_ROOT"
 
+PI_DOCKER_ENV=""
+if [ "${HERMES_PI_EXPLICIT_DOCKER_GATE:-}" = "1" ]; then
+  image=${HERMES_TEST_PI_IMAGE:-}
+  digest=${image#sha256:}
+  if [ "$image" = "$digest" ] || [ "${#digest}" -ne 64 ]; then
+    echo "error: explicit Pi Docker gate requires an immutable sha256 image ID" >&2
+    exit 2
+  fi
+  case "$digest" in
+    *[!0-9a-f]*)
+      echo "error: explicit Pi Docker gate requires an immutable sha256 image ID" >&2
+      exit 2
+      ;;
+  esac
+  PI_DOCKER_ENV="HERMES_TEST_PI_IMAGE=$image"
+fi
+
 # ── Pre-compile .pyc bytecode cache ─────────────────────────────────────────
 # Each test file runs in its own subprocess via run_tests_parallel.py.
 # Pre-building the bytecode cache once here (instead of each subprocess
@@ -178,6 +195,7 @@ exec env -i \
   PYTHONUTF8=1 \
   ${HERMES_RUN_SLOW_PET_TESTS:+HERMES_RUN_SLOW_PET_TESTS="$HERMES_RUN_SLOW_PET_TESTS"} \
   ${HERMES_E2E_BROWSER:+HERMES_E2E_BROWSER="$HERMES_E2E_BROWSER"} \
+  ${PI_DOCKER_ENV:+"$PI_DOCKER_ENV"} \
   ${EXTRA_PYTHONPATH:+PYTHONPATH="$EXTRA_PYTHONPATH"} \
   ${EXTRA_PYTEST_PLUGINS:+PYTEST_PLUGINS="$EXTRA_PYTEST_PLUGINS"} \
   "$PYTHON" "$SCRIPT_DIR/run_tests_parallel.py" "$@"

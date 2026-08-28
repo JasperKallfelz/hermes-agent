@@ -11,6 +11,8 @@ Pure-function / config-driven; no live model calls.
 from typing import Any
 from unittest.mock import patch
 
+import pytest
+
 from agent import background_review as br
 
 
@@ -109,6 +111,57 @@ def test_routing_resolution_failure_falls_back_to_parent():
         rt = br._resolve_review_runtime(agent)
     assert rt["routed"] is False
     assert rt["provider"] == "openai-codex"
+
+
+def test_pi_parent_requires_explicit_hermes_native_review_route():
+    agent = _FakeAgent()
+    setattr(agent, "_current_main_runtime", lambda: {
+        "api_key": "", "base_url": "", "api_mode": "pi_rpc"
+    })
+    with patch("hermes_cli.config.load_config_readonly", return_value={}):
+        with pytest.raises(RuntimeError, match="explicit Hermes-native"):
+            br._resolve_review_runtime(agent)
+
+
+def test_pi_parent_explicit_review_route_cannot_recurse_into_pi():
+    agent = _FakeAgent()
+    setattr(agent, "_current_main_runtime", lambda: {
+        "api_key": "", "base_url": "", "api_mode": "pi_rpc"
+    })
+    cfg = {"auxiliary": {"background_review": {
+        "provider": "openrouter", "model": "review-model",
+    }}}
+    fake_rp = {
+        "provider": "openrouter", "model": "review-model",
+        "api_mode": "pi_rpc", "base_url": "https://openrouter.ai/api/v1",
+        "api_key": "key",
+    }
+    with patch("hermes_cli.config.load_config_readonly", return_value=cfg), patch(
+        "hermes_cli.runtime_provider.resolve_runtime_provider", return_value=fake_rp
+    ):
+        with pytest.raises(RuntimeError, match="returned the main-agent Pi runtime"):
+            br._resolve_review_runtime(agent)
+
+
+def test_pi_parent_explicit_review_route_keeps_auxiliary_wire_mode():
+    agent = _FakeAgent()
+    setattr(agent, "_current_main_runtime", lambda: {
+        "api_key": "", "base_url": "", "api_mode": "pi_rpc"
+    })
+    cfg = {"auxiliary": {"background_review": {
+        "provider": "openrouter", "model": "review-model",
+    }}}
+    fake_rp = {
+        "provider": "openrouter", "model": "review-model",
+        "api_mode": "chat_completions", "base_url": "https://openrouter.ai/api/v1",
+        "api_key": "key",
+    }
+    with patch("hermes_cli.config.load_config_readonly", return_value=cfg), patch(
+        "hermes_cli.runtime_provider.resolve_runtime_provider", return_value=fake_rp
+    ):
+        rt = br._resolve_review_runtime(agent)
+    assert rt["api_mode"] == "chat_completions"
+    assert rt["routed"] is True
 
 
 # ---------------------------------------------------------------------------

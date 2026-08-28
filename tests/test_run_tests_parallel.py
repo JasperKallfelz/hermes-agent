@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import textwrap
@@ -378,6 +379,198 @@ def test_zero_collected_across_run_fails_and_says_so(tmp_path: Path) -> None:
     assert proc.returncode == 1, proc.stdout
     assert "NO TESTS RAN" in proc.stdout
     assert "NOT a pass" in proc.stdout
+
+
+def test_explicit_release_gate_rejects_any_skipped_test(tmp_path: Path) -> None:
+    probe = tmp_path / "test_release_skip.py"
+    probe.write_text(
+        "import pytest\n\n@pytest.mark.skip(reason='must not pass release gate')\n"
+        "def test_containment():\n    pass\n",
+        encoding="utf-8",
+    )
+    repo_root = Path(__file__).resolve().parent.parent
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(repo_root / "scripts" / "run_tests_parallel.py"),
+            str(probe),
+            "--require-no-skips",
+            "--file-retries",
+            "0",
+            "-j",
+            "1",
+            "-q",
+        ],
+        cwd=repo_root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 1, proc.stdout
+    assert "skips are forbidden" in proc.stdout
+
+
+def test_all_skipped_run_reports_skips_without_misleading_green_headline(
+    tmp_path: Path,
+) -> None:
+    probe = tmp_path / "test_all_skipped.py"
+    probe.write_text(
+        "import pytest\n\n"
+        "@pytest.mark.skip(reason='platform')\n"
+        "def test_one(): pass\n\n"
+        "@pytest.mark.skip(reason='platform')\n"
+        "def test_two(): pass\n",
+        encoding="utf-8",
+    )
+    proc = _run_runner(tmp_path, "--file-retries", "0", "-q")
+    assert proc.returncode == 0, proc.stdout
+    assert "2 tests skipped, 0 passed, 0 failed" in proc.stdout
+    assert "all collected tests skipped" in proc.stdout
+    assert "0 tests passed, 0 failed (100% complete)" not in proc.stdout
+
+
+def test_mixed_run_reports_passed_and_skipped_counts(tmp_path: Path) -> None:
+    probe = tmp_path / "test_mixed.py"
+    probe.write_text(
+        "import pytest\n\n"
+        "def test_passes(): pass\n\n"
+        "@pytest.mark.skip(reason='platform')\n"
+        "def test_skips(): pass\n",
+        encoding="utf-8",
+    )
+    proc = _run_runner(tmp_path, "--file-retries", "0", "-q")
+    assert proc.returncode == 0, proc.stdout
+    assert "1 tests passed, 0 failed, 1 skipped" in proc.stdout
+
+
+def test_pi_docker_release_wrapper_validates_and_forwards_only_immutable_id(
+    tmp_path: Path,
+) -> None:
+    repo_root = Path(__file__).resolve().parent.parent
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    shutil.copyfile(repo_root / "scripts" / "run_pi_release_tests.sh", scripts / "run_pi_release_tests.sh")
+    capture = tmp_path / "capture.txt"
+    runner = scripts / "run_tests.sh"
+    runner.write_text(
+        "#!/bin/sh\n"
+        f"printf '%s\\n' \"${{HERMES_TEST_PI_IMAGE:-missing}}|$*\" > {str(capture)!r}\n",
+        encoding="utf-8",
+    )
+    runner.chmod(0o700)
+    wrapper = scripts / "run_pi_release_tests.sh"
+    wrapper.chmod(0o700)
+    image = "sha256:" + "a" * 64
+    valid = subprocess.run(
+        [str(wrapper), "--docker"],
+        cwd=tmp_path,
+        env={**os.environ, "HERMES_TEST_PI_IMAGE": image},
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+    assert valid.returncode == 0, valid.stderr
+    assert capture.read_text(encoding="utf-8").strip() == (
+        f"{image}|--file-retries 0 --require-no-skips "
+        "tests/agent/transports/test_pi_docker_egress_e2e.py"
+    )
+
+    invalid = subprocess.run(
+        [str(wrapper), "--docker"],
+        cwd=tmp_path,
+        env={**os.environ, "HERMES_TEST_PI_IMAGE": "repo/pi:latest"},
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+    assert invalid.returncode == 2
+    assert "immutable sha256 image ID" in invalid.stderr
+
+
+def test_pi_release_wrapper_forwards_fail_closed_flags_and_runner_failure(
+    tmp_path: Path,
+) -> None:
+    repo_root = Path(__file__).resolve().parent.parent
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    shutil.copyfile(
+        repo_root / "scripts" / "run_pi_release_tests.sh",
+        scripts / "run_pi_release_tests.sh",
+    )
+    capture = tmp_path / "capture.txt"
+    runner = scripts / "run_tests.sh"
+    runner.write_text(
+        "#!/bin/sh\n"
+        f"printf '%s\\n' \"$*\" > {str(capture)!r}\n"
+        "exit 19\n",
+        encoding="utf-8",
+    )
+    runner.chmod(0o700)
+    wrapper = scripts / "run_pi_release_tests.sh"
+    wrapper.chmod(0o700)
+    result = subprocess.run(
+        [str(wrapper)], cwd=tmp_path, text=True, capture_output=True, timeout=30,
+    )
+    assert result.returncode == 19
+    args = capture.read_text(encoding="utf-8").split()
+    assert args[:3] == ["--file-retries", "0", "--require-no-skips"]
+    assert (
+        "--deselect=tests/test_run_tests_parallel.py::"
+        "test_drive_letter_colon_is_not_a_path_separator"
+    ) in args
+
+
+def test_hermetic_runner_forwards_pi_image_only_for_explicit_docker_gate(
+    tmp_path: Path,
+) -> None:
+    repo_root = Path(__file__).resolve().parent.parent
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    shutil.copyfile(repo_root / "scripts" / "run_tests.sh", scripts / "run_tests.sh")
+    (scripts / "run_tests_parallel.py").write_text("# fake runner\n", encoding="utf-8")
+    venv_bin = tmp_path / ".venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    (venv_bin / "activate").write_text("", encoding="utf-8")
+    capture = tmp_path / "runner-env.txt"
+    fake_python = venv_bin / "python"
+    fake_python.write_text(
+        "#!/bin/sh\n"
+        "if [ \"${1:-}\" = -c ]; then exit 0; fi\n"
+        "if [ \"${1:-}\" = -m ]; then exit 0; fi\n"
+        f"printf '%s\\n' \"${{HERMES_TEST_PI_IMAGE:-missing}}\" > {str(capture)!r}\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o700)
+    wrapper = scripts / "run_tests.sh"
+    wrapper.chmod(0o700)
+    image = "sha256:" + "b" * 64
+
+    ordinary = subprocess.run(
+        [str(wrapper), "tests/example.py"],
+        cwd=tmp_path,
+        env={**os.environ, "HERMES_TEST_PI_IMAGE": image},
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+    assert ordinary.returncode == 0, ordinary.stderr
+    assert capture.read_text(encoding="utf-8").strip() == "missing"
+
+    explicit = subprocess.run(
+        [str(wrapper), "--require-no-skips", "tests/example.py"],
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "HERMES_TEST_PI_IMAGE": image,
+            "HERMES_PI_EXPLICIT_DOCKER_GATE": "1",
+        },
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+    assert explicit.returncode == 0, explicit.stderr
+    assert capture.read_text(encoding="utf-8").strip() == image
 
 
 

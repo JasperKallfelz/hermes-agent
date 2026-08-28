@@ -51,11 +51,22 @@ class TestSetRuntime:
         old = crs.set_runtime(cfg, "codex_app_server")
         assert old == "auto"
         assert cfg["model"]["openai_runtime"] == "codex_app_server"
+        assert cfg["agent"]["runtime"] == "codex_app_server"
 
 
     def test_invalid_value_raises(self):
         with pytest.raises(ValueError):
             crs.set_runtime({}, "garbage")
+
+    def test_legacy_command_can_leave_pi_for_hermes(self):
+        cfg = {
+            "agent": {"runtime": "pi_rpc", "pi_rpc": {"enabled": True}},
+            "model": {"openai_runtime": "auto"},
+        }
+        result = crs.apply(cfg, "auto")
+        assert result.success is True
+        assert result.requires_new_session is True
+        assert cfg["agent"]["runtime"] == "hermes"
 
 
 class TestApply:
@@ -168,5 +179,4 @@ class TestApply:
         assert r.new_value == "codex_app_server"
         assert "MCP migration skipped" in r.message
         assert "disk full" in r.message
-
 

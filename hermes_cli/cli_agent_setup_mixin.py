@@ -33,14 +33,14 @@ class CLIAgentSetupMixin:
         """
         from cli import ChatConsole, _cprint, logger
         from hermes_cli.runtime_provider import (
-            resolve_runtime_provider,
             format_runtime_provider_error,
+            resolve_main_agent_runtime_provider,
         )
 
         _primary_exc = None
         runtime = None
         try:
-            runtime = resolve_runtime_provider(
+            runtime = resolve_main_agent_runtime_provider(
                 requested=self.requested_provider,
                 explicit_api_key=self._explicit_api_key,
                 explicit_base_url=self._explicit_base_url,
@@ -61,13 +61,16 @@ class CLIAgentSetupMixin:
                     try:
                         from hermes_cli.fallback_config import resolve_entry_api_key
 
-                        _fb_kwargs = {"requested": _fb_provider}
+                        _fb_kwargs = {
+                            "requested": _fb_provider,
+                            "target_model": _fb_model,
+                        }
                         if _fb.get("base_url"):
                             _fb_kwargs["explicit_base_url"] = _fb["base_url"]
                         _fb_api_key = resolve_entry_api_key(_fb)
                         if _fb_api_key:
                             _fb_kwargs["explicit_api_key"] = _fb_api_key
-                        runtime = resolve_runtime_provider(**_fb_kwargs)
+                        runtime = resolve_main_agent_runtime_provider(**_fb_kwargs)
                         logger.warning(
                             "Primary provider auth failed (%s). Falling through to fallback: %s/%s",
                             _primary_exc, _fb_provider, _fb_model,
@@ -199,10 +202,10 @@ class CLIAgentSetupMixin:
         message into a chat that cannot work (#62935-adjacent UX class:
         keyless first run must route into onboarding, not a broken chat).
         """
-        from hermes_cli.runtime_provider import resolve_runtime_provider
+        from hermes_cli.runtime_provider import resolve_main_agent_runtime_provider
 
         try:
-            runtime = resolve_runtime_provider(
+            runtime = resolve_main_agent_runtime_provider(
                 requested=self.requested_provider,
                 explicit_api_key=self._explicit_api_key,
                 explicit_base_url=self._explicit_base_url,

@@ -21,6 +21,7 @@ _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
 classify = _mod.classify
 ci_review_files = _mod.ci_review_files
+unexpected_required_results = _mod.unexpected_required_results
 
 DEFAULT = {
     "python": True,
@@ -37,11 +38,12 @@ DEFAULT = {
     "installer": True,
     "rust": True,
     "mcp_catalog": False,
+    "pi_runtime": True,
     "ci_review": True,
 }
 
 
-def _lanes(python=False, frontend=False, site=False, scan=False, deps=False, uv_lock=False, npm_lock=False, installer=False, rust=False, mcp_catalog=False, docker_meta=False, ci_review=False, python_prod=None, nix=None, docker=None) -> dict[str, bool]:
+def _lanes(python=False, frontend=False, site=False, scan=False, deps=False, uv_lock=False, npm_lock=False, installer=False, rust=False, mcp_catalog=False, docker_meta=False, ci_review=False, python_prod=None, nix=None, docker=None, pi_runtime=False) -> dict[str, bool]:
     # python_prod tracks python except for tests-only diffs; default it to
     # python so the majority of cases don't need to spell it out.
     #
@@ -65,14 +67,18 @@ def _lanes(python=False, frontend=False, site=False, scan=False, deps=False, uv_
         "installer": installer,
         "rust": rust,
         "mcp_catalog": mcp_catalog,
+        "pi_runtime": pi_runtime,
         "ci_review": ci_review,
     }
 
 
 CASES = {
     "docs-only → nothing heavy": (["README.md", "docs/guide.md"], _lanes()),
-    "python source → python": (["run_agent.py"], _lanes(python=True, scan=True)),
-    "dep manifest → python": (["pyproject.toml"], _lanes(python=True, scan=True, deps=True, uv_lock=True)),
+    "python source → python": (["run_agent.py"], _lanes(python=True, scan=True, pi_runtime=True)),
+    "dep manifest → Python and packaged Pi assets": (
+        ["pyproject.toml"],
+        _lanes(python=True, scan=True, deps=True, uv_lock=True, pi_runtime=True),
+    ),
     "uv.lock → python": (["uv.lock"], _lanes(python=True, uv_lock=True)),
     "ts package → frontend": (["apps/desktop/src/app.tsx"], _lanes(frontend=True)),
     "ui-tui → frontend": (["ui-tui/src/entry.ts"], _lanes(frontend=True)),
@@ -134,7 +140,10 @@ CASES = {
         ["scripts/tests/test-install-ps1-longpath.ps1"],
         _lanes(python=True, installer=True),
     ),
-    "python source alone → no installer lane": (["run_agent.py"], _lanes(python=True, scan=True)),
+    "python source alone → no installer lane": (
+        ["run_agent.py"],
+        _lanes(python=True, scan=True, pi_runtime=True),
+    ),
     # `.rs` lives under apps/, so it matches `frontend` too. That lane builds
     # TypeScript and cannot notice a Rust error — before `rust` existed it was
     # the ONLY lane a Rust change ran, and the crate's tests never executed.
@@ -169,11 +178,27 @@ CASES = {
         ["tests/agent/test_foo.py", "agent/x.py"],
         _lanes(python=True, scan=True),
     ),
+    "Pi runtime source → dedicated gates": (
+        ["agent/transports/pi_rpc_session.py"],
+        _lanes(python=True, scan=True, pi_runtime=True),
+    ),
+    "Pi runtime tests → dedicated gates": (
+        ["tests/agent/transports/test_pi_rpc_client.py"],
+        _lanes(python=True, python_prod=False, scan=True, pi_runtime=True),
+    ),
+    "Pi release script → dedicated gates": (
+        ["scripts/run_pi_release_tests.sh"],
+        _lanes(python=True, pi_runtime=True),
+    ),
+    "Pi evidence generator → dedicated gates": (
+        ["scripts/generate_pi_runtime_evidence.py"],
+        _lanes(python=True, scan=True, pi_runtime=True),
+    ),
     # Runner infrastructure is NOT tests-only — a bad runner edit can mask
     # real failures, so it keeps the conservative full lane set.
     "test runner script → python_prod stays on": (
         ["scripts/run_tests_parallel.py"],
-        _lanes(python=True, scan=True),
+        _lanes(python=True, scan=True, pi_runtime=True),
     ),
     # Supply-chain lanes
     ".pth file → scan": (["evil.pth"], _lanes(python=True, scan=True)),
@@ -290,6 +315,103 @@ def _iter_if_expressions(job: object):
             yield cond
 
 
+@pytest.mark.parametrize("path", [
+    "run_agent.py",
+    "acp_adapter/session.py",
+    "agent/background_review.py",
+    "agent/conversation_loop.py",
+    "cli.py",
+    "cron/scheduler.py",
+    "gateway/run.py",
+    "hermes_cli/cli_agent_setup_mixin.py",
+    "hermes_cli/commands.py",
+    "hermes_cli/oneshot.py",
+    "hermes_cli/runtime_provider.py",
+    "hermes_cli/runtime_switch.py",
+    "gateway/slash_commands.py",
+    "tui_gateway/server.py",
+    "tui_gateway/methods_complete.py",
+    "tui_gateway/methods_session.py",
+    "tui_gateway/methods_prompt.py",
+    "toolsets.py",
+    "scripts/run_tests.sh",
+    "scripts/run_tests_parallel.py",
+    "tests/test_run_tests_parallel.py",
+    "apps/desktop/src/lib/desktop-slash-commands.ts",
+    "apps/desktop/src/lib/desktop-slash-commands.test.ts",
+    "apps/desktop/src/app/session/hooks/use-prompt-actions/slash.ts",
+    "apps/desktop/src/app/session/hooks/use-prompt-actions/index.test.tsx",
+])
+def test_shared_pi_sensitive_boundary_triggers_runtime_lane(path):
+    assert classify([path])["pi_runtime"] is True
+
+
+_PI_RUNTIME_SELF_TRIGGER_PATHS = (
+    "scripts/ci/classify_changes.py",
+    "tests/ci/test_classify_changes.py",
+    "tests/fixtures/pi_rpc/README.md",
+    "tests/fixtures/pi_rpc/fake_pi_rpc.py",
+    "tests/fixtures/pi_rpc/settled.jsonl",
+    "scripts/run_pi_release_tests.sh",
+    ".github/actions/detect-changes/action.yml",
+    ".github/workflows/ci.yaml",
+    ".github/workflows/pi-runtime.yml",
+)
+
+
+@pytest.mark.parametrize("path", _PI_RUNTIME_SELF_TRIGGER_PATHS)
+def test_pi_gate_and_classifier_surfaces_immutably_self_trigger(path):
+    assert classify([path])["pi_runtime"] is True
+
+
+def test_pi_workflow_has_blocking_exact_windows_drive_letter_gate():
+    workflow = _yaml(".github/workflows/pi-runtime.yml")
+    jobs = workflow["jobs"]
+    windows = jobs["windows-path-parser"]
+
+    assert windows["runs-on"] == "windows-latest"
+    assert "if" not in windows
+    assert windows.get("continue-on-error") is not True
+
+    matching_steps = [
+        step for step in windows["steps"]
+        if isinstance(step, dict)
+        and "test_drive_letter_colon_is_not_a_path_separator" in str(step.get("run") or "")
+    ]
+    assert len(matching_steps) == 1
+    step = matching_steps[0]
+    command = " ".join(str(step["run"]).split())
+    assert step.get("continue-on-error") is not True
+    assert "scripts/run_tests.sh --file-retries 0 --require-no-skips" in command
+    assert "tests/test_run_tests_parallel.py" in command
+    assert "-k test_drive_letter_colon_is_not_a_path_separator" in command
+
+    docker_needs = jobs["docker-containment"]["needs"]
+    assert "windows-path-parser" in docker_needs
+
+    ci = _yaml(".github/workflows/ci.yaml")
+    assert "pi-runtime" in ci["jobs"]["all-checks-pass"]["needs"]
+
+
+def test_non_windows_release_deselection_is_backed_by_blocking_windows_job():
+    wrapper = (_REPO / "scripts/run_pi_release_tests.sh").read_text(encoding="utf-8")
+    node = (
+        "tests/test_run_tests_parallel.py::"
+        "test_drive_letter_colon_is_not_a_path_separator"
+    )
+    assert f"--deselect={node}" in wrapper
+
+    workflow = _yaml(".github/workflows/pi-runtime.yml")
+    windows = workflow["jobs"]["windows-path-parser"]
+    assert windows["runs-on"] == "windows-latest"
+    assert any(
+        node.rsplit("::", 1)[1] in str(step.get("run") or "")
+        and "--file-retries 0" in str(step.get("run") or "")
+        and "--require-no-skips" in str(step.get("run") or "")
+        for step in windows["steps"] if isinstance(step, dict)
+    )
+
+
 def test_ci_review_files_returns_only_sensitive_paths_sorted_and_unique():
     assert ci_review_files([
         "apps/desktop/src/app.tsx",
@@ -300,3 +422,29 @@ def test_ci_review_files_returns_only_sensitive_paths_sorted_and_unique():
         ".github/workflows/ci.yml",
         "apps/desktop/eslint.config.mjs",
     ]
+
+
+@pytest.mark.parametrize("result", ["failure", "cancelled", "timed_out", "action_required", ""])
+def test_aggregate_rejects_every_unexpected_terminal_result(result):
+    needs = {
+        "detect": {"result": "success", "outputs": {"pi_runtime": "true"}},
+        "pi-runtime": {"result": result},
+    }
+    assert unexpected_required_results(needs) == ["pi-runtime"]
+
+
+def test_aggregate_preserves_only_an_intended_pi_skip():
+    needs = {
+        "detect": {"result": "success", "outputs": {"pi_runtime": "false"}},
+        "pi-runtime": {"result": "skipped"},
+        "frontend": {"result": "skipped"},
+    }
+    assert unexpected_required_results(needs) == []
+
+
+def test_aggregate_rejects_pi_skip_when_lane_was_required():
+    needs = {
+        "detect": {"result": "success", "outputs": {"pi_runtime": "true"}},
+        "pi-runtime": {"result": "skipped"},
+    }
+    assert unexpected_required_results(needs) == ["pi-runtime"]

@@ -42,6 +42,8 @@ function registryCatalog(
 const REGISTRY_CATALOG = registryCatalog(
   {
     '/approvals': 'options',
+    '/runtime': 'options',
+    '/reasoning': 'options',
     '/review': 'text',
     '/refine': 'text',
     '/usage': null,
@@ -61,7 +63,13 @@ const REGISTRY_CATALOG = registryCatalog(
     '/loop': 'mixed',
     '/lcm': 'text'
   },
-  { '/tasks': '/agents', '/bg': '/background', '/q': '/queue', '/proactive': '/loop' }
+  {
+    '/tasks': '/agents',
+    '/bg': '/background',
+    '/q': '/queue',
+    '/proactive': '/loop',
+    '/thinking': '/reasoning'
+  }
 )
 
 describe('desktop slash command curation', () => {
@@ -84,6 +92,11 @@ describe('desktop slash command curation', () => {
     expect(isDesktopSlashSuggestion('/approvals')).toBe(true)
     expect(isDesktopSlashCommand('/approvals')).toBe(true)
     expect(resolveDesktopCommand('/approvals')?.surface).toEqual({ kind: 'exec' })
+    expect(isDesktopSlashSuggestion('/runtime')).toBe(true)
+    expect(isDesktopSlashCommand('/runtime')).toBe(true)
+    expect(desktopSlashCommandArgumentMode('/runtime')).toBe('options')
+    expect(isDesktopSlashSuggestion('/reasoning')).toBe(true)
+    expect(resolveDesktopCommand('/thinking')?.name).toBe('/reasoning')
     expect(isDesktopSlashSuggestion('/review')).toBe(true)
     expect(isDesktopSlashCommand('/review')).toBe(true)
     expect(resolveDesktopCommand('/review')?.surface).toEqual({ kind: 'exec' })

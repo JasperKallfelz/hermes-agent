@@ -16,6 +16,7 @@ import pytest
 
 import gateway.run as gateway_run
 from gateway.config import Platform
+from gateway.platforms.base import MessageEvent, MessageType
 from gateway.session import SessionSource
 
 
@@ -103,8 +104,16 @@ fallback_providers:
         encoding="utf-8",
     )
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    resolver_calls = []
 
-    def fake_resolve_runtime_provider(*, requested=None, explicit_base_url=None, explicit_api_key=None):
+    def fake_resolve_runtime_provider(
+        *,
+        requested=None,
+        target_model=None,
+        explicit_base_url=None,
+        explicit_api_key=None,
+    ):
+        resolver_calls.append((requested, target_model))
         if requested in {None, "", "openai-codex"}:
             from hermes_cli.auth import AuthError
             raise AuthError("No Codex credentials stored. Run `hermes auth` to authenticate.")
@@ -135,5 +144,51 @@ fallback_providers:
     assert model == "minimax/minimax-m2.7"
     assert runtime_kwargs["provider"] == "openrouter"
     assert runtime_kwargs["api_key"] == "sk-openrouter"
+    assert ("openrouter", "minimax/minimax-m2.7") in resolver_calls
 
 
+@pytest.mark.asyncio
+async def test_gateway_pi_model_command_preserves_nested_model_id(
+    tmp_path, monkeypatch
+):
+    class Session:
+        def available_models(self):
+            return [
+                {"provider": "openrouter", "id": "anthropic/claude-sonnet"}
+            ]
+
+        def set_model(self, provider, model_id):
+            return types.SimpleNamespace(
+                model_provider=provider,
+                model_id=model_id,
+                thinking_level="high",
+            )
+
+    native = Session()
+    agent = types.SimpleNamespace(api_mode="pi_rpc", provider="old", model="old")
+    runner = _make_runner()
+    runner._running_agents["pi-session"] = agent
+    runner._normalize_source_for_session_key = lambda source: source
+    runner._session_key_for_source = lambda _source: "pi-session"
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    monkeypatch.setattr(
+        "agent.pi_runtime.get_or_create_pi_session", lambda _agent: native
+    )
+    event = MessageEvent(
+        text="/model openrouter/anthropic/claude-sonnet --session",
+        message_type=MessageType.TEXT,
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="nested-model",
+            chat_type="dm",
+        ),
+    )
+
+    result = await runner._handle_model_command(event)
+
+    assert result is not None and "runtime=pi" in result
+    assert (agent.provider, agent.model) == (
+        "openrouter",
+        "anthropic/claude-sonnet",
+    )

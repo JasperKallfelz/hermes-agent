@@ -29,9 +29,10 @@ Lanes:
   lives under ``apps/``, so without this lane a Rust change matched ``frontend``
   and only the TypeScript matrix ran.
 * ``mcp_catalog`` — bundled MCP catalog / installer review.
+* ``pi_runtime``  — pinned Pi runtime unit, packaging, and Docker gates.
 
-Docker is not a lane — it builds on push-to-main and release only,
-never per-PR.
+The general Hermes image is not a lane. The separately pinned Pi image is
+covered by ``pi_runtime`` because its containment E2E is a security gate.
 
 Contract — *fail open, never closed*. We may run a lane we didn't need, but
 must never skip one a change could break:
@@ -58,6 +59,8 @@ from __future__ import annotations
 import json
 import os
 import sys
+from collections.abc import Mapping
+from typing import cast
 
 _FRONTEND = ("ui-tui/", "web/", "apps/")  # TS typecheck-matrix packages
 _ROOT_NPM = {"package.json", "package-lock.json"}  # shifts every package's tree
@@ -103,6 +106,70 @@ _SCAN_FILES = {"setup.cfg", "pyproject.toml"}
 # MCP catalog files that require explicit security review.
 _MCP_CATALOG_PATHS = ("optional-mcps/",)
 _MCP_CATALOG_FILES = {"hermes_cli/mcp_catalog.py"}
+_PI_RUNTIME_PATHS = (
+    ".github/actions/detect-changes/action.yml",
+    ".github/workflows/ci.yaml",
+    ".github/workflows/pi-runtime.yml",
+    "run_agent.py",
+    "acp_adapter/server.py",
+    "acp_adapter/session.py",
+    "agent/agent_init.py",
+    "agent/background_review.py",
+    "agent/codex_runtime.py",
+    "agent/conversation_compression.py",
+    "agent/conversation_loop.py",
+    "agent/external_runtime/",
+    "agent/pi_runtime.py",
+    "agent/transports/pi_",
+    "cli.py",
+    "cron/scheduler.py",
+    "gateway/run.py",
+    "hermes_cli/pi_runtime_cli.py",
+    "hermes_cli/cli_agent_setup_mixin.py",
+    "hermes_cli/cli_commands_mixin.py",
+    "hermes_cli/codex_runtime_switch.py",
+    "hermes_cli/commands.py",
+    "hermes_cli/doctor.py",
+    "hermes_cli/main.py",
+    "hermes_cli/oneshot.py",
+    "hermes_cli/runtime_provider.py",
+    "hermes_cli/runtime_switch.py",
+    "gateway/slash_commands.py",
+    "toolsets.py",
+    "tui_gateway/host_supervisor.py",
+    "tui_gateway/methods_prompt.py",
+    "tui_gateway/server.py",
+    "tui_gateway/methods_complete.py",
+    "tui_gateway/methods_session.py",
+    "references/pi-rpc-runtime.md",
+    "scripts/ci/classify_changes.py",
+    "scripts/generate_pi_runtime_evidence.py",
+    "scripts/run_pi_release_tests.sh",
+    "scripts/run_tests.sh",
+    "scripts/run_tests_parallel.py",
+    "tests/agent/transports/test_pi_",
+    "tests/acp_adapter/test_acp_commands.py",
+    "tests/cli/test_cli_steer_busy_path.py",
+    "tests/ci/test_classify_changes.py",
+    "tests/fixtures/pi_rpc/",
+    "tests/gateway/test_busy_session_ack.py",
+    "tests/gateway/test_session_model_override_routing.py",
+    "tests/hermes_cli/test_pi_runtime",
+    "tests/hermes_cli/test_runtime_switch.py",
+    "tests/run_agent/test_background_review_cost_controls.py",
+    "tests/run_agent/test_pi_rpc",
+    "tests/test_tui_gateway_queue_on_busy.py",
+    "tests/test_tui_gateway_server.py",
+    "tests/tui_gateway/test_compute_host_phase1.py",
+    "tests/test_run_tests_parallel.py",
+    "tests/tools/test_coding_task_tool.py",
+    "tests/tui_gateway/test_pi_runtime",
+    "apps/desktop/src/lib/desktop-slash-commands.ts",
+    "apps/desktop/src/lib/desktop-slash-commands.test.ts",
+    "apps/desktop/src/app/session/hooks/use-prompt-actions/",
+    "tools/coding_task_tool.py",
+    "pyproject.toml",
+)
 
 # Windows installer + its PowerShell tests. These only run on a Windows runner,
 # so they get their own lane rather than riding along with ``python``.
@@ -183,6 +250,32 @@ def ci_review_files(files: list[str]) -> list[str]:
     return sorted({f.strip() for f in files if f.strip() and _is_ci_review(f.strip())})
 
 
+def unexpected_required_results(needs: Mapping[str, object]) -> list[str]:
+    """Return failed/cancelled/unknown jobs, including required Pi skips."""
+    unexpected: list[str] = []
+    detect = needs.get("detect")
+    detect_mapping = (
+        cast(Mapping[str, object], detect) if isinstance(detect, Mapping) else {}
+    )
+    detect_outputs = detect_mapping.get("outputs", {})
+    output_mapping = (
+        cast(Mapping[str, object], detect_outputs)
+        if isinstance(detect_outputs, Mapping)
+        else {}
+    )
+    pi_required = str(output_mapping.get("pi_runtime") or "").lower() == "true"
+    for name, raw in needs.items():
+        raw_mapping = (
+            cast(Mapping[str, object], raw) if isinstance(raw, Mapping) else {}
+        )
+        result = str(raw_mapping.get("result") or "")
+        if result not in {"success", "skipped"}:
+            unexpected.append(name)
+        elif name == "pi-runtime" and pi_required and result != "success":
+            unexpected.append(name)
+    return sorted(unexpected)
+
+
 def classify(files: list[str]) -> dict[str, bool]:
     """Map changed paths to ``{lane: should_run}``."""
     files = [f.strip() for f in files if f.strip()]
@@ -207,6 +300,7 @@ def classify(files: list[str]) -> dict[str, bool]:
         "installer": any(_is_installer(f) for f in files),
         "rust": any(_is_rust(f) for f in files),
         "mcp_catalog": any(_is_mcp_catalog(f) for f in files),
+        "pi_runtime": any(f.startswith(_PI_RUNTIME_PATHS) for f in files),
         "ci_review": any(_is_ci_review(f) for f in files),
         "nix": python_prod or frontend or any(_is_nix(f) for f in files)
     }
@@ -225,6 +319,7 @@ def classify(files: list[str]) -> dict[str, bool]:
         ret["rust"] = True
         ret["nix"] = True
         ret["ci_review"] = True
+        ret["pi_runtime"] = True
 
         # explicitly skip mcp catalog here. it's not needed unless those files are modified.
     return ret

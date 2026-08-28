@@ -824,6 +824,11 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--require-no-skips",
+        action="store_true",
+        help="Fail if any selected test is skipped (dedicated release gates only).",
+    )
+    parser.add_argument(
         "--slice",
         metavar="I/N",
         help=(
@@ -885,6 +890,7 @@ def main() -> int:
     OUR_FLAGS = {
         "-j", "--jobs", "--paths", "--include-integration",
         "--file-timeout", "--file-retries", "--slice", "--generate-slices", "--files",
+        "--require-no-skips",
     }
     # pytest short flags that consume the NEXT token as their value.
     PYTEST_VALUE_FLAGS = {"-k", "-m", "-p", "-o", "-c", "-r", "-W"}
@@ -1141,8 +1147,20 @@ def main() -> int:
     elapsed = time.monotonic() - started
     print()
     pct = min(100, (tests_done / approx_total_tests * 100)) if approx_total_tests else 0
-    skipped_note = f", {tests_skipped} skipped" if tests_skipped else ""
-    print(f"=== Summary: {len(files)} files, {tests_passed} tests passed, {tests_failed} failed{skipped_note} ({pct:.0f}% complete) in {elapsed:.1f}s ({args.jobs} workers) ===")
+    if tests_skipped and not tests_passed and not tests_failed:
+        result_counts = (
+            f"{tests_skipped} tests skipped, 0 passed, 0 failed "
+            "(all collected tests skipped)"
+        )
+    else:
+        result_counts = (
+            f"{tests_passed} tests passed, {tests_failed} failed, "
+            f"{tests_skipped} skipped ({pct:.0f}% complete)"
+        )
+    print(
+        f"=== Summary: {len(files)} files, {result_counts} in {elapsed:.1f}s "
+        f"({args.jobs} workers) ==="
+    )
 
     # Host-OS gating note: tests marked for another OS were skipped by the
     # conftest hook, not run. Say so explicitly — a green local run on Linux
@@ -1162,9 +1180,8 @@ def main() -> int:
     # is deliberately tolerated above (platform-gated files), but if NOTHING
     # ran anywhere the invocation itself was broken — a venv without pytest, a
     # -k/-m filter that matched nothing, or collection erroring everywhere.
-    # The summary line above reads green at a glance ("0 failed ... 100%
-    # complete"), which has been misread as a successful verification, so say
-    # it plainly AND fail the exit code.
+    # A zero-collection summary can be misread as successful verification, so
+    # say it plainly AND fail the exit code.
     no_tests_ran_at_all = bool(files) and tests_collected == 0
     if no_tests_ran_at_all:
         print()
@@ -1178,6 +1195,14 @@ def main() -> int:
             "matched nothing; or collection errored in every file."
         )
         print("  Check the per-file output above for the real error.")
+
+    forbidden_skips = bool(args.require_no_skips and tests_skipped)
+    if forbidden_skips:
+        print()
+        print(
+            f"=== ✗ RELEASE GATE SKIPPED {tests_skipped} TEST"
+            f"{'S' if tests_skipped != 1 else ''} — skips are forbidden. ==="
+        )
 
     # Flaky files: failed once, passed on the automatic retry. Green, but
     # loudly reported so they get fixed instead of silently re-flaking.
@@ -1253,6 +1278,9 @@ def main() -> int:
         return 1
 
     if no_tests_ran_at_all:
+        return 1
+
+    if forbidden_skips:
         return 1
 
     return 0
